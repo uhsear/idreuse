@@ -1063,6 +1063,17 @@ def self_test():
           "--out is read")
     check(_parse(["l.csv", "r.csv", "--apply"]).apply is True,
           "--apply is read")
+    # With abbreviations on, --ap parses as --apply and writes the file.
+    ap_err = io.StringIO()
+    with contextlib.redirect_stderr(ap_err):
+        try:
+            _parse(["l.csv", "r.csv", "--ap"])
+            ap_refused = False
+        except SystemExit:
+            ap_refused = True
+    check(ap_refused and "unrecognized arguments" in ap_err.getvalue(),
+          "a unique prefix of --apply is refused, not read as --apply"
+          "  <-- pinned defect")
 
     # ---- the field maps the two sides are read with
     args = _parse(["l.csv", "r.csv"])
@@ -1427,6 +1438,7 @@ def _parse(argv):
                     "every match the geometry disproves.",
         epilog="Both layers must be in one projected CRS. Nothing is written "
                "without --apply.",
+        allow_abbrev=False,
     )
     ap.add_argument("left", nargs="?", metavar="LEFT",
                     help="the first layer as a CSV")

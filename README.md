@@ -63,18 +63,19 @@ PASS  main with no argv reads the arguments after the program name
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  and raises() accepts the ValueError it is looking for
 --------------------------------------------------------------------
-258 assertions, 0 failed
+265 assertions, 0 failed
 ```
 
-The full run prints all 258 assertions. The three `...` lines above are where this block is cut.
+The full run prints all 265 assertions. The three `...` lines above are where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The same 258 assertions run everywhere: 258 on Windows (3.13.2) and 258 on Ubuntu (3.12.3). The
-code uses no syntax newer than Python 3.6, but 3.12 is the oldest interpreter it has been run on.
+The current run prints 265 assertions on Windows (3.13.2). The Ubuntu (3.12.3) run has not been
+repeated since the allow_abbrev change. The code uses no syntax newer than Python 3.6, but 3.12 is
+the oldest interpreter it has been run on.
 
 Both layers must already be in one projected CRS, in feet or in metres. The tool measures a
 straight line between two points and converts nothing. Feed it latitude and longitude and it

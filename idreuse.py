@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """Reconcile two asset layers on a shared ID and refuse every match the geometry disproves.
 
-Refuses the ID itself when it is not unique, and refuses a status or district
-column that holds one value on every row.
+Refuses the ID itself when it is not unique, refuses a status or district
+column that cannot carry a signal, and refuses to call a run clean when it
+compared nothing.
 
 Two departments track the same assets and agree to key on one number. The join
 on that number succeeds, most rows match, and a recycled number links a live
@@ -33,8 +34,11 @@ different districts is escalated to REUSED. --rematch-distance proposes a
 CANDIDATE partner for a row the key could not pair, but only when each row is
 the other's single nearest. Nothing is written without --apply.
 
-Exit codes: 0 no match was disproved, 1 at least one match was disproved, 2 a
-file could not be read or written, 3 the anchor was refused, 64 usage error.
+Exit codes: 0 at least one pair was measured and no match was disproved, 1 at
+least one match was disproved, 2 a file could not be read or written, 3 the
+anchor was refused, 4 nothing was compared (rows were read and no pair on a
+shared key had a measurable separation), 64 usage error, 70 an unexpected
+crash, which is never a finding.
 """
 
 from __future__ import print_function
@@ -46,9 +50,12 @@ import importlib.util
 import io
 import math
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import traceback
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -100,6 +107,9 @@ CLASSES = (CONFIRMED, DRIFT, REUSED, UNMATCHED, UNVERIFIED)
 CANDIDATE = "CANDIDATE"
 ALL_CLASSES = CLASSES + (CANDIDATE,)
 
+# A line break inside a quoted cell, as csv itself counts them.
+_BREAK = re.compile(r"\r\n|\r|\n")
+
 # The columns --out writes. This is a new file, not a copy of either input,
 # because there are two inputs and one of them has no row for half the keys.
 OUT_COLUMNS = ("side", "csv_line", "key", "class", "distance", "x", "y",
@@ -114,7 +124,8 @@ CROSSWALK_COLUMNS = ("left_key", "right_key", "tier", "distance", "left_line",
 class Row(object):
     """One input row, reduced to the four values this tool reasons about."""
 
-    def __init__(self, index, side, key, x, y, status=None, district=None):
+    def __init__(self, index, side, key, x, y, status=None, district=None,
+                 line=None):
         self.index = index
         self.side = side
         self.key = key
@@ -122,14 +133,13 @@ class Row(object):
         self.y = y
         self.status = status
         self.district = district
+        # The line this row starts on in its CSV, which is what the operator
+        # has open. A blank line or a quoted newline moves it away from
+        # index + 2, so the reader passes the real one. Without it, index 0 is
+        # the first data row on line 2, below the header.
+        self.line = self.index + 2 if line is None else line
         self.verdict = None
         self.reason = ""
-
-    @property
-    def line(self):
-        """The line this row is on in its CSV, which is what the operator has
-        open. Index 0 is the first data row, and line 1 is the header."""
-        return self.index + 2
 
     def __repr__(self):
         return "Row(%s, %d, %r, %s)" % (self.side, self.line, self.key,
@@ -206,6 +216,18 @@ class Report(object):
     def disproved(self):
         """Pairs the geometry disproved. This is what the exit code reads."""
         return [p for p in self.pairs if p.verdict == REUSED]
+
+    @property
+    def measured(self):
+        """Pairs on a shared key whose separation could be measured. A run
+        with rows and none of these compared nothing, whatever it printed."""
+        return [p for p in self.pairs if p.distance is not None]
+
+    @property
+    def compared_nothing(self):
+        """Rows were read, nothing was refused or disproved, and no pair was
+        measured. The join may be wrong and this run could not tell."""
+        return bool(self.total) and not self.refused and not self.measured
 
     def __repr__(self):
         if self.refused:
@@ -348,9 +370,16 @@ def district_signal(values, column):
 
     The same proof the status column gets. A district column that holds one
     value on every row cannot say that two rows sit in different districts,
-    so escalating on it would escalate nothing and look like a defence.
+    so escalating on it would escalate nothing and look like a defence. A
+    blank is a hole, not a value, so it is not counted: a column that is blank
+    on most rows and "7" on the rest would otherwise read as holding two.
     """
-    return _signal(values, column, "district",
+    filled = [v for v in values if v is not None and str(v).strip()]
+    if values and not filled:
+        return False, ("district column %r is blank on all %d row(s), so it "
+                       "is refused as a district signal and no pair is "
+                       "escalated on it." % (column, len(values)))
+    return _signal(filled, column, "district",
                    "one district from another",
                    "no pair is escalated on it",
                    "a drift pair whose two sides disagree is escalated to "
@@ -375,6 +404,60 @@ def _signal(values, column, kind, separates, refused, usable):
                           refused))
     return True, ("%s column %r holds %d distinct value(s), so %s"
                   % (kind, column, len(seen), usable))
+
+
+def _few(values):
+    """Up to five values, sorted, for a message."""
+    shown = sorted(values)
+    text = ", ".join(repr(v) for v in shown[:5])
+    return text + (", ..." if len(shown) > 5 else "")
+
+
+def district_vocabulary(left, right, right_by_key, column, confirm):
+    """Message when the two sides do not use one district coding, else None.
+
+    district_signal proves the column can tell districts apart. It cannot
+    prove the two layers name them the same way, and two departments rarely
+    do: "7", "07", "D7" and "Station 7" are four different strings and one
+    district. Escalating on that would condemn every drift pair. So the
+    column must also share a value across the sides, agree on at least one
+    key-matched pair, and agree on most of the pairs the geometry already
+    confirms, because one object cannot sit in two districts.
+    """
+    mine = set(r.district for r in left if r.district)
+    theirs = set(r.district for r in right if r.district)
+    head = "district column %r is refused as a district signal: " % column
+    tail = " No pair is escalated on it."
+    if not mine or not theirs:
+        return head + "the %s side has no district value." % (
+            "left" if not mine else "right") + tail
+    if not mine & theirs:
+        return head + ("the two sides share no value. Left holds %s and "
+                       "right holds %s, so they are not coded the same way."
+                       % (_few(mine), _few(theirs))) + tail
+    agree = confirmed_agree = confirmed_differ = 0
+    for row in left:
+        other = right_by_key.get(row.key) if row.key else None
+        if other is None or not row.district or not other.district:
+            continue
+        same = row.district == other.district
+        agree += same
+        distance = separation(row.x, row.y, other.x, other.y)
+        if distance is not None and distance <= confirm:
+            if same:
+                confirmed_agree += 1
+            else:
+                confirmed_differ += 1
+    if not agree:
+        return head + ("no pair on a shared key has the same district on "
+                       "both sides.") + tail
+    if confirmed_differ > confirmed_agree:
+        return head + ("%d of the %d pairs the geometry confirms are in "
+                       "different districts on the two sides, so the codes "
+                       "do not match." % (confirmed_differ,
+                                          confirmed_differ + confirmed_agree)
+                       ) + tail
+    return None
 
 
 def status_disagreement(left, right, column):
@@ -488,10 +571,17 @@ def reconcile(left, right, confirm=DEFAULT_CONFIRM_DISTANCE,
             raise ValueError("the rematch distance %r is above the confirm "
                              "distance %r" % (rematch_distance, confirm))
 
+    right_by_key = dict((r.key, r) for r in right if r.key)
+
     district_note = None
     if district_column:
         usable, district_note = district_signal(
             [r.district for r in list(left) + list(right)], district_column)
+        if usable:
+            refusal = district_vocabulary(left, right, right_by_key,
+                                          district_column, confirm)
+            if refusal:
+                usable, district_note = False, refusal
         if not usable:
             district_column = None
 
@@ -504,8 +594,6 @@ def reconcile(left, right, confirm=DEFAULT_CONFIRM_DISTANCE,
             # Refused as a signal. The rows keep their values; nothing reads
             # them again.
             status_column = None
-
-    right_by_key = dict((r.key, r) for r in right if r.key)
 
     pairs = []
     for row in left:
@@ -564,7 +652,9 @@ def gate(report):
     """Exit code for a report, which is the whole point of running this."""
     if report.refused:
         return 3
-    return 1 if report.disproved else 0
+    if report.disproved:
+        return 1
+    return 4 if report.compared_nothing else 0
 
 
 def describe(report, sample=DEFAULT_SAMPLE):
@@ -654,6 +744,12 @@ def describe(report, sample=DEFAULT_SAMPLE):
     if report.disproved:
         out.append("VERDICT: %d match(es) disproved by the geometry. Do not "
                    "publish this join." % len(report.disproved))
+    elif report.compared_nothing:
+        out.append("VERDICT: NOTHING COMPARED. No pair on a shared key had a "
+                   "separation that could be measured, so the geometry "
+                   "checked nothing. This is not a clean join. Look for an ID "
+                   "spelled differently on the two sides, or for coordinates "
+                   "this tool cannot read.")
     else:
         out.append("VERDICT: no match was disproved by the geometry.")
     return out
@@ -721,7 +817,18 @@ def classified_rows(report):
 # ------------------------------------------------------------------ self-test
 
 def self_test():
-    """Assertions over the decision core. No file, no network, no credentials."""
+    """Run the assertions in a temp directory that is removed even when one
+    of them raises, so a crash never leaves idreuse-selftest-* behind."""
+    tmp = tempfile.mkdtemp(prefix="idreuse-selftest-")
+    try:
+        return _self_test(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _self_test(tmp):
+    """Assertions over the decision core. No network, no credentials. The
+    only files are the ones written under tmp."""
     passed = [0]
     failed = []
 
@@ -750,7 +857,8 @@ def self_test():
                 reuse=DEFAULT_REUSE_DISTANCE):
         return classify_separation(distance, confirm, reuse)[0]
 
-    print("idreuse self-test: no file, no network, no credentials")
+    print("idreuse self-test: temporary files only, no network, no "
+          "credentials")
     print("-" * 68)
 
     # ---- the three separations the thresholds were set from
@@ -758,10 +866,10 @@ def self_test():
           "a pair 51 units apart is CONFIRMED, which is the ordinary case")
     check(verdict(300.0) == DRIFT,
           "a pair 300 units apart is DRIFT, neither confirmed nor rejected")
-    check(verdict(248940.0) == REUSED,
-          "a pair 248940 units apart is REUSED, never a match"
+    check(verdict(250000.0) == REUSED,
+          "a pair 250000 units apart is REUSED, never a match"
           "  <-- pinned defect")
-    check(classify_separation(248940.0)[1].endswith("One key, two objects."),
+    check(classify_separation(250000.0)[1].endswith("One key, two objects."),
           "the refusal says in words that one key covers two objects")
 
     # ---- the thresholds at their exact boundary
@@ -946,7 +1054,7 @@ def self_test():
     far = [("H-1", 1000.0, 249940.0, None)]
     rep = layers(near, far)
     check(rep.counts[REUSED] == 2,
-          "a pair 248940 units apart classifies both rows REUSED")
+          "a pair 250000 units apart classifies both rows REUSED")
     check(gate(rep) == 1, "and fails the gate  <-- pinned defect")
     check(len(rep.disproved) == 1, "one match was disproved")
     check(rep.disproved[0].key == "H-1", "and the disproved pair names its key")
@@ -986,7 +1094,9 @@ def self_test():
           "  <-- pinned defect")
     check(rep.pairs[0].distance is None,
           "and the pair carries no distance at all")
-    check(gate(rep) == 0, "an unverified pair does not fail the gate")
+    check(gate(rep) == 4,
+          "a run whose only pair is UNVERIFIED exits 4, not 0: it compared "
+          "nothing  <-- pinned defect")
     rep = layers([("", 0.0, 0.0, None)], [("H-1", 0.0, 0.0, None)])
     check(rep.counts[UNVERIFIED] == 1 and rep.counts[UNMATCHED] == 1,
           "a row with no anchor is UNVERIFIED and the other side is UNMATCHED")
@@ -1261,9 +1371,13 @@ def self_test():
           "and so is a district that was never read")
 
     spread = [("A", 0.0, 0.0, "7"), ("B", 0.0, 0.0, "7"),
-              ("C", 0.0, 0.0, "7"), ("D", 0.0, 0.0, "7")]
+              ("C", 0.0, 0.0, "7"), ("D", 0.0, 0.0, "7"),
+              ("G", 0.0, 0.0, "7")]
+    # G is the pair that agrees: C alone, confirmed across a line, would
+    # make most confirmed pairs disagree and refuse the column.
     moved = [("A", 0.0, 300.0, "8"), ("B", 0.0, 300.0, "7"),
-             ("C", 0.0, 51.0, "8"), ("D", 0.0, 9000.0, "8")]
+             ("C", 0.0, 51.0, "8"), ("D", 0.0, 9000.0, "8"),
+             ("G", 0.0, 10.0, "7")]
     rep = dlayers(spread, moved, district_column="DISTRICT")
     by_key = dict((p.key, p) for p in rep.pairs)
     check(by_key["A"].verdict == REUSED,
@@ -1285,7 +1399,7 @@ def self_test():
     check(gate(rep) == 1 and len(rep.disproved) == 2,
           "the escalated pair fails the gate with the one the distance "
           "disproved")
-    check(rep.classified == rep.total == 8,
+    check(rep.classified == rep.total == 10,
           "and every row is still in exactly one class")
     check("DISTRICT" in rep.district_note and "2 distinct" in rep.district_note,
           "the report carries the proof that the district column has a "
@@ -1339,10 +1453,10 @@ def self_test():
     check(nearest(origin, tie + [Row(2, "right", "U-3", 0.0, 5.0)])[0]
           is not None, "a strictly closer row breaks an earlier tie")
 
-    # The recycled number from the story. H-3's key points at a row 248940
+    # The recycled number from the story. H-3's key points at a row 250000
     # units away, and its real partner sits 13 units off under another key.
     story_left = [("H-1", 0.0, 0.0, None), ("H-3", 5000.0, 5000.0, None)]
-    story_right = [("H-1", 0.0, 51.0, None), ("H-3", 5000.0, 253940.0, None),
+    story_right = [("H-1", 0.0, 51.0, None), ("H-3", 5000.0, 255000.0, None),
                    ("W-3", 5012.0, 5005.0, None)]
     rep = layers(story_left, story_right)
     check(rep.counts[CANDIDATE] == 0 and rep.candidates == [],
@@ -1416,9 +1530,10 @@ def self_test():
                  [("W-1", 0.0, 1.0, None)], rematch_distance=50.0)
     check(rep.refused and rep.candidates == [] and rep.classified == 0,
           "a refused run rematches nothing")
-    many = layers([("H-%d" % i, i * 1000.0, 0.0, None) for i in range(12)],
-                  [("W-%d" % i, i * 1000.0, 5.0, None) for i in range(12)],
-                  rematch_distance=50.0)
+    many = layers([("H-%d" % i, i * 1000.0, 0.0, None) for i in range(12)]
+                  + [("Z", 99000.0, 0.0, None)],
+                  [("W-%d" % i, i * 1000.0, 5.0, None) for i in range(12)]
+                  + [("Z", 99000.0, 5.0, None)], rematch_distance=50.0)
     lines = describe(many, sample=10)
     check(len(many.candidates) == 12
           and sum(1 for l in lines if " -> " in l) == 10
@@ -1426,6 +1541,10 @@ def self_test():
           "candidates are sampled and counted like every other list")
     check(gate(many) == 0,
           "a CANDIDATE alone never fails the gate: it is a proposal")
+    check(gate(layers([("H-0", 0.0, 0.0, None)], [("W-0", 0.0, 5.0, None)],
+                      rematch_distance=50.0)) == 4,
+          "but a CANDIDATE with no pair on a shared key compared nothing, "
+          "which exits 4")
     check("  ...and 2 more" not in describe(layers(
         [("H-%d" % i, i * 1000.0, 0.0, None) for i in range(10)],
         [("W-%d" % i, i * 1000.0, 5.0, None) for i in range(10)],
@@ -1433,10 +1552,11 @@ def self_test():
           "and ten candidates at a sample of ten print no ...and line")
 
     # ---- the district escalation feeds the rematch pool
-    rep = dlayers([("H-6", 0.0, 0.0, "7")],
-                  [("H-6", 0.0, 350.0, "8"), ("W-6", 3.0, 4.0, "7")],
+    rep = dlayers([("H-1", 0.0, 0.0, "7"), ("H-6", 0.0, 0.0, "7")],
+                  [("H-1", 0.0, 10.0, "7"), ("H-6", 0.0, 350.0, "8"),
+                   ("W-6", 3.0, 4.0, "7")],
                   district_column="DISTRICT", rematch_distance=50.0)
-    check(rep.pairs[0].verdict == REUSED and len(rep.candidates) == 1
+    check(rep.pairs[1].verdict == REUSED and len(rep.candidates) == 1
           and rep.candidates[0].right.key == "W-6",
           "an escalated pair's row is rematched to the partner in its own "
           "district")
@@ -1447,7 +1567,8 @@ def self_test():
                   district_column="DISTRICT", rematch_distance=50.0)
     walk = crosswalk_rows(rep)
     check([(r["left_key"], r["right_key"], r["tier"]) for r in walk]
-          == [("B", "B", DRIFT), ("C", "C", CONFIRMED), ("F", "W", CANDIDATE)],
+          == [("B", "B", DRIFT), ("C", "C", CONFIRMED), ("G", "G", CONFIRMED),
+              ("F", "W", CANDIDATE)],
           "the crosswalk holds CONFIRMED, DRIFT and CANDIDATE links, pairs "
           "first")
     check(not any(r["tier"] in (REUSED, UNVERIFIED, UNMATCHED) for r in walk),
@@ -1465,9 +1586,9 @@ def self_test():
     check(out_rows[1]["class"] == CANDIDATE and out_rows[1]["distance"]
           == "13.000",
           "an --out row that rematched carries its candidate's distance, not "
-          "the 248940 that disproved its key")
+          "the 250000 that disproved its key")
     check(out_rows[3]["class"] == REUSED
-          and out_rows[3]["distance"] == "248940.000",
+          and out_rows[3]["distance"] == "250000.000",
           "while the row its key pointed at keeps the disproved distance")
 
     # ---- argument handling
@@ -1627,9 +1748,8 @@ def self_test():
     check(missing_columns(fields, []) == ["ASSET_ID", "X", "Y"],
           "an empty header is missing all three")
 
-    # ---- real files on disk. Everything below writes into one temp directory
-    # and deletes it again. No network, no database, no credentials.
-    tmp = tempfile.mkdtemp(prefix="idreuse-selftest-")
+    # ---- real files on disk. Everything below writes into tmp, which
+    # self_test deletes again. No network, no database, no credentials.
 
     def tmpfile(name, text, encoding="utf-8"):
         path = os.path.join(tmp, name)
@@ -1658,7 +1778,7 @@ def self_test():
         "HYDRANT_NO,X,Y,OPERABLE\n"
         "H-1,620100.0,1580251.0,1\n"
         "H-2,620500.0,1580900.0,1\n"
-        "H-3,621000.0,1829940.0,1\n"
+        "H-3,621000.0,1831000.0,1\n"
         "H-4,,,1\n"
         "U-9,622200.0,1582200.0,1\n")
     fire_csv = tmpfile("fire.csv", fire_text)
@@ -1669,7 +1789,7 @@ def self_test():
     check(code == 1, "the two hydrant layers fail the gate")
     check("VERDICT: 1 match(es) disproved" in out,
           "because one match is disproved by the geometry")
-    check("H-3  248940.0 ft apart, left line 4, right line 4" in out,
+    check("H-3  250000.0 ft apart, left line 4, right line 4" in out,
           "and it is named with its separation and both CSV lines")
     check("rows classified: 10 of 10" in out,
           "every row of both files is classified")
@@ -1690,10 +1810,10 @@ def self_test():
     check(("  %-11s %6d" % (CONFIRMED, 0)) in out,
           "a confirm distance under every pair confirms nothing")
     code, out, err = run_cli(base + ["--units", "m"])
-    check("248940.0 m apart" in out,
+    check("250000.0 m apart" in out,
           "--units relabels every distance and converts nothing")
     code, out, err = run_cli(base + ["--sample", "0"])
-    check("H-3  248940.0" not in out and "VERDICT: 1 match(es)" in out,
+    check("H-3  250000.0" not in out and "VERDICT: 1 match(es)" in out,
           "--sample 0 lists no match and still reports the verdict")
 
     # ---- the status column, through the CLI, on the layers from the story
@@ -1706,8 +1826,8 @@ def self_test():
     check(code == 1,
           "the run continues and still fails on the match it disproved"
           "  <-- pinned defect")
-    live_text = util_text.replace("H-3,621000.0,1829940.0,1",
-                                  "H-3,621000.0,1829940.0,0")
+    live_text = util_text.replace("H-3,621000.0,1831000.0,1",
+                                  "H-3,621000.0,1831000.0,0")
     live_csv = tmpfile("utilities-live.csv", live_text)
     code, out, err = run_cli([fire_csv, live_csv, "--id-field", "HYDRANT_NO",
                               "--status-field", "OPERABLE"])
@@ -1743,7 +1863,7 @@ def self_test():
         "odd.csv",
         "NUM,POINT_X,POINT_Y,ACTIVEFLAG\n"
         "H-1,620100.0,1580251.0,1\n"
-        "H-3,621000.0,1829940.0,1\n")
+        "H-3,621000.0,1831000.0,1\n")
     code, out, err = run_cli([fire_csv, odd_csv, "--id-field", "HYDRANT_NO"])
     check(code == 64, "a right side that names nothing expected is refused")
     check("utilities" not in err and "columns not in" in err,
@@ -1755,7 +1875,7 @@ def self_test():
                               "--right-x-field", "POINT_X",
                               "--right-y-field", "POINT_Y"])
     check(code == 1, "the three right-side overrides make the same file usable")
-    check("H-3  248940.0 ft apart" in out,
+    check("H-3  250000.0 ft apart" in out,
           "and the recycled number is found through them")
     check(err == "", "with nothing reported missing")
 
@@ -1775,7 +1895,7 @@ def self_test():
     check(len(written) == 10, "one row per input row from both files")
     check([r["class"] for r in written].count(REUSED) == 2,
           "the disproved pair is written on both its rows")
-    check(written[2]["key"] == "H-3" and written[2]["distance"] == "248940.000",
+    check(written[2]["key"] == "H-3" and written[2]["distance"] == "250000.000",
           "and carries the separation that disproved it")
     check(written[4]["class"] == UNMATCHED and written[4]["distance"] == "",
           "an unmatched row is written with no distance")
@@ -1805,7 +1925,7 @@ def self_test():
         "HYDRANT_NO,X,Y,OPERABLE,DIST\n"
         "H-1,620100.0,1580251.0,1,7\n"
         "H-2,620500.0,1580900.0,1,7\n"
-        "H-3,621000.0,1829940.0,1,9\n"
+        "H-3,621000.0,1831000.0,1,9\n"
         "H-4,,,1,7\n"
         "U-9,622200.0,1582200.0,1,7\n"
         "H-6,622600.0,1582950.0,1,8\n"
@@ -1924,8 +2044,10 @@ def self_test():
     header_only = tmpfile("header.csv", "HYDRANT_NO,X,Y,OPERABLE\n")
     code, out, err = run_cli([header_only, util_csv, "--id-field",
                               "HYDRANT_NO"])
-    check(code == 0 and "rows classified: 5 of 5" in out,
-          "a layer with no rows classifies the other side and passes")
+    check(code == 4 and "rows classified: 5 of 5" in out
+          and "NOTHING COMPARED" in out,
+          "a layer with no rows classifies the other side, but compared "
+          "nothing, so it exits 4 and not 0  <-- pinned defect")
     argv_before = sys.argv
     try:
         sys.argv = ["idreuse.py", fire_csv, util_csv, "--id-field",
@@ -1934,6 +2056,322 @@ def self_test():
               "main with no argv reads the arguments after the program name")
     finally:
         sys.argv = argv_before
+
+    # ---- review round 1. Each block pins a defect that was reproduced first.
+
+    # A run that compared nothing is not a clean run.
+    comma_l = tmpfile("comma-l.csv", 'ID,X,Y\nH-1,"620,100.5","1,580,200.5"\n')
+    comma_r = tmpfile("comma-r.csv", 'ID,X,Y\nH-1,"630,100.5","1,590,200.5"\n')
+    code, out, err = run_cli([comma_l, comma_r, "--id-field", "ID"])
+    check(code == 4 and "VERDICT: NOTHING COMPARED" in out
+          and "no match was disproved" not in out,
+          "coordinates with thousands separators are UNVERIFIED, so the run "
+          "exits 4 and does not call itself clean  <-- pinned defect")
+    spell_l = tmpfile("spell-l.csv", "ID,X,Y\nH-1,1000,1000\nH-2,2000,2000\n")
+    spell_r = tmpfile("spell-r.csv", "ID,X,Y\nH1,1000,1000\nH2,2000,2000\n")
+    code, out, err = run_cli([spell_l, spell_r, "--id-field", "ID"])
+    check(code == 4 and "pairs: 0 on a shared key" in out
+          and "NOTHING COMPARED" in out,
+          "an ID spelled H-1 on one side and H1 on the other pairs nothing, "
+          "so the run exits 4  <-- pinned defect")
+    check(gate(layers([], [])) == 0 and not layers([], []).compared_nothing,
+          "two empty layers are not a failed comparison, there was no row")
+    check(layers([("H-1", 0.0, 0.0, None)],
+                 [("H-1", 0.0, 9000.0, None)]).measured != [],
+          "a measured pair is what separates a clean run from one that "
+          "compared nothing")
+    check(gate(layers([("H-1", 0.0, 0.0, None)],
+                      [("H-1", 0.0, 51.0, None), ("H-2", 0.0, 0.0, None)])) == 0,
+          "and one measured pair among unmatched rows is still a clean exit 0")
+
+    # The district column must share a vocabulary across the two sides.
+    spread7 = [("A", 0.0, 0.0, "7"), ("B", 0.0, 0.0, "8"),
+               ("C", 0.0, 0.0, "7")]
+    for label, other in (("D7", ("D7", "D8", "D7")), ("07", ("07", "08", "07"))):
+        rep = dlayers(spread7, [("A", 0.0, 300.0, other[0]),
+                                ("B", 0.0, 300.0, other[1]),
+                                ("C", 0.0, 300.0, other[2])],
+                      district_column="DISTRICT")
+        check("share no value" in rep.district_note
+              and [p.verdict for p in rep.pairs] == [DRIFT] * 3
+              and gate(rep) == 0,
+              "'7' on one side and '%s' on the other share no value, so the "
+              "column is refused and nothing is escalated  "
+              "<-- pinned defect" % label)
+    rep = dlayers(spread7, [("A", 0.0, 300.0, ""), ("B", 0.0, 300.0, ""),
+                            ("C", 0.0, 300.0, "")],
+                  district_column="DISTRICT")
+    check("right side has no district value" in rep.district_note
+          and gate(rep) == 0,
+          "a right column that is blank on every row is refused by name, "
+          "not passed because the left side has two values  "
+          "<-- pinned defect")
+    check("left side has no district value" in dlayers(
+        [("A", 0.0, 0.0, ""), ("B", 0.0, 0.0, "")],
+        [("A", 0.0, 300.0, "7"), ("B", 0.0, 300.0, "8")],
+        district_column="DISTRICT").district_note,
+          "and a blank left column is named as the left side")
+    usable, message = district_signal(["", None, " "], "DISTRICT")
+    check(usable is False and "blank on all 3 row(s)" in message,
+          "a district column that is blank everywhere is refused  "
+          "<-- pinned defect")
+    check(district_signal(["7", "", ""], "DISTRICT")[0] is False,
+          "a blank is a hole, so '7' and blanks hold one value, not two")
+    rep = dlayers([("A", 0.0, 0.0, "7"), ("B", 0.0, 0.0, "8")],
+                  [("A", 0.0, 300.0, "8"), ("B", 0.0, 300.0, "7")],
+                  district_column="DISTRICT")
+    check("no pair on a shared key has the same district" in rep.district_note
+          and gate(rep) == 0,
+          "two columns that share values but never agree on a pair are "
+          "refused  <-- pinned defect")
+    rep = dlayers([("A", 0.0, 0.0, "7"), ("B", 0.0, 0.0, "8"),
+                   ("C", 0.0, 0.0, "7"), ("D", 0.0, 0.0, "7")],
+                  [("A", 0.0, 10.0, "8"), ("B", 0.0, 10.0, "7"),
+                   ("C", 0.0, 10.0, "7"), ("D", 0.0, 300.0, "8")],
+                  district_column="DISTRICT")
+    check("2 of the 3 pairs the geometry confirms" in rep.district_note
+          and rep.pairs[3].verdict == DRIFT,
+          "when most pairs the geometry confirms disagree on district the "
+          "codes do not match, and the drift pair is not escalated  "
+          "<-- pinned defect")
+    rep = dlayers([("A", 0.0, 0.0, "7"), ("B", 0.0, 0.0, "8"),
+                   ("C", 0.0, 0.0, "7")],
+                  [("A", 0.0, 150.0, "8"), ("B", 0.0, 150.0, "7"),
+                   ("C", 0.0, 10.0, "7")],
+                  district_column="DISTRICT")
+    check("2 of the 3 pairs the geometry confirms" in rep.district_note,
+          "a pair exactly at the confirm distance counts as confirmed here "
+          "too  <-- pinned defect")
+    rep = dlayers([("A", 0.0, 0.0, "7"), ("B", None, None, "8"),
+                   ("C", 0.0, 0.0, "7")],
+                  [("A", 0.0, 10.0, "7"), ("B", 0.0, 10.0, "7"),
+                   ("C", 0.0, 300.0, "8")],
+                  district_column="DISTRICT")
+    check(rep.district_note is not None
+          and "refused" not in rep.district_note
+          and rep.pairs[2].verdict == REUSED,
+          "a pair with no coordinate is not counted as confirmed, so it "
+          "cannot sink the column")
+    many_d = [("K%d" % i, 0.0, 0.0, "7") for i in range(21)]
+    rep = dlayers(many_d, [("K%d" % i, 0.0, 10.0, "8" if i < 10 else "7")
+                           for i in range(21)], district_column="DISTRICT")
+    lines = describe(rep, sample=10)
+    check(rep.district_note is not None and "refused" not in rep.district_note
+          and sum(1 for l in lines if "different districts on DISTRICT" in l)
+          == 10 and not any(l.startswith("  ...and") for l in lines),
+          "ten district disagreements at a sample of ten print no ...and "
+          "line at all, not even a 0 more")
+    check("  ...and 1 more" in describe(rep, sample=9),
+          "and a sample of nine counts exactly one unlisted")
+    refused_d = dlayers(spread7, [("A", 0.0, 300.0, "D7"),
+                                  ("B", 0.0, 300.0, "D8"),
+                                  ("C", 0.0, 300.0, "D7")],
+                        district_column="DISTRICT")
+    check(not any(p.district_note for p in refused_d.pairs),
+          "a refused district column leaves no pair carrying a district "
+          "note")
+    check(_few(set("abcde")) == "'a', 'b', 'c', 'd', 'e'"
+          and _few(set("abcdef")) == "'a', 'b', 'c', 'd', 'e', ...",
+          "a message lists five values and then says there are more")
+    check("holds the single value '7'" in dlayers(
+        [("A", 0.0, 0.0, "7")], [("A", 0.0, 300.0, "")],
+        district_column="DISTRICT").district_note,
+          "a column that is '7' on one side and blank on the other is a "
+          "single value, and says so rather than naming the blank side")
+
+    # The line a row is on in its own file.
+    nl_path = tmpfile("lines.csv",
+                      'ID,X,Y,NOTE\n'
+                      'A,1,2,"two\nlines"\n'
+                      '\n'
+                      'B,3,4,x\n'
+                      'C,5,6,"a\r\nb\r\nc"\r\n'
+                      'D,7,8,x,"e\nf"\n'
+                      'E,9,10\n')
+    nl_rows, nl_header = read_csv(nl_path)
+    check([r.line for r in nl_rows] == [2, 5, 6, 9, 11],
+          "a blank line and a quoted newline do not move the reported line "
+          "off the file  <-- pinned defect")
+    check([r.key for r in extract_rows(nl_rows, "left",
+                                       {"key": "ID", "x": "X", "y": "Y",
+                                        "status": None})][-1] == "E"
+          and extract_rows(nl_rows, "left", {"key": "ID", "x": "X", "y": "Y",
+                                             "status": None})[-1].line == 11,
+          "and extract_rows carries that line onto the row")
+    check(Row(0, "left", "H-1", 0.0, 0.0, line=9).line == 9
+          and Row(3, "left", "H-1", 0.0, 0.0).line == 5,
+          "a row built with no line falls back to index + 2")
+    gap_l = tmpfile("gap-l.csv", 'ID,X,Y,NOTE\nH-1,0,0,"a\nb"\n\n\nH-3,0,0,x\n')
+    gap_r = tmpfile("gap-r.csv", "ID,X,Y\nH-3,0,9000\n")
+    code, out, err = run_cli([gap_l, gap_r, "--id-field", "ID"])
+    check("H-3  9000.0 ft apart, left line 6, right line 2" in out,
+          "the report names the line the operator will find the row on  "
+          "<-- pinned defect")
+
+    # The two boundaries of the rematch.
+    edge = layers([("A", 0.0, 0.0, None)], [("B", 0.0, 50.0, None)],
+                  rematch_distance=50.0)
+    check(len(edge.candidates) == 1,
+          "a candidate exactly at the rematch distance is found, the limit "
+          "is inclusive  <-- pinned defect")
+    check(layers([("A", 0.0, 0.0, None)], [("B", 0.0, 50.0, None)],
+                 rematch_distance=49.999).candidates == [],
+          "and one a hair beyond it is not")
+    check(layers([("A", 0.0, 0.0, None)], [("B", 0.0, 1.0, None)],
+                 rematch_distance=DEFAULT_CONFIRM_DISTANCE).candidates != [],
+          "a rematch distance equal to the confirm distance is accepted  "
+          "<-- pinned defect")
+    raises(lambda: layers([], [], rematch_distance=150.001),
+           "and one a hair above it is refused")
+
+    # The CLI hand-offs that no other assertion could see fail.
+    real_self_test = globals()["self_test"]
+    try:
+        globals()["self_test"] = lambda: 7
+        handed = run_cli(["--self-test", "ignored.csv"])[0]
+    finally:
+        globals()["self_test"] = real_self_test
+    check(handed == 7,
+          "main returns the exit status of --self-test, so a red self-test "
+          "fails CI  <-- pinned defect")
+    code, out, err = run_cli([fire_csv, "--id-field", "HYDRANT_NO"])
+    check(code == 64 and "two CSV layers are required" in err,
+          "one layer is a usage error even when its columns exist  "
+          "<-- pinned defect")
+    code, out, err = run_cli(base)
+    plain = out.splitlines()
+    check(not any(l.startswith(("STATUS", "DISTRICT")) for l in plain)
+          and "Check only" not in out and "districts" not in out
+          and "different districts" not in out
+          and "disagree on the status column" not in out
+          and not any(l.lstrip().startswith("...and") for l in plain),
+          "a plain run prints no STATUS, DISTRICT, 'Check only' or ...and "
+          "line  <-- pinned defect")
+    check(not any(l.lstrip().startswith("...and")
+                  for l in describe(layers(
+                      [("H-%d" % i, i * 1000.0, 0.0, None) for i in range(10)],
+                      [("W-%d" % i, i * 1000.0, 5.0, None) for i in range(10)],
+                      rematch_distance=50.0),
+                      sample=10)),
+          "ten rematch candidates at a sample of ten print no ...and 0 more")
+    code, out, err = run_cli(base2 + ["--rematch-distance", "200"])
+    check(code == 64 and out == "",
+          "a usage error prints nothing to stdout, so it cannot pass for the "
+          "start of a good run  <-- pinned defect")
+    code, out, err = run_cli(base + ["--right-status-field", "OPERABLE"])
+    check(code == 64 and "needs --status-field" in err,
+          "a right status column with no left one is a usage error, not "
+          "silently ignored  <-- pinned defect")
+    check(run_cli(base + ["--proj"])[0] == 64,
+          "a prefix of --projected is refused like a prefix of --apply")
+
+    # Degrees are not feet.
+    deg_l = tmpfile("deg-l.csv", "ASSET_ID,X,Y\nH-1,-82.10,29.10\n")
+    deg_r = tmpfile("deg-r.csv", "ASSET_ID,X,Y\nH-1,-81.50,29.80\n")
+    code, out, err = run_cli([deg_l, deg_r])
+    check(code == 64 and "look like degrees" in err and out == "",
+          "two layers whose coordinates all fit longitude and latitude are "
+          "refused, because 60 miles apart reads as CONFIRMED  "
+          "<-- pinned defect")
+    code, out, err = run_cli([deg_l, deg_r, "--projected"])
+    check(code == 0 and "CONFIRMED" in out,
+          "and --projected says they are a local grid and runs them")
+    check(looks_like_degrees([]) is False
+          and looks_like_degrees([Row(0, "left", "a", None, None)]) is False
+          and looks_like_degrees([Row(0, "left", "a", 10.0, 20.0)]) is True
+          and looks_like_degrees([Row(0, "left", "a", 10.0, 20.0),
+                                  Row(1, "left", "b", 620100.0, 20.0)])
+          is False
+          and looks_like_degrees([Row(0, "left", "a", 10.0, 91.0)]) is False
+          and looks_like_degrees([Row(0, "left", "a", -181.0, 5.0)]) is False
+          and looks_like_degrees([Row(0, "left", "a", 180.0, -90.0)]) is True
+          and looks_like_degrees([Row(0, "left", "a", None, 20.0),
+                                  Row(1, "left", "b", 10.0, None)]) is False,
+          "the degrees check reads the box inclusively, skips an unreadable "
+          "row, and needs a coordinate to judge")
+
+    # An output may not be an input, or the other output.
+    before = [open(p, "rb").read() for p in (fire_csv, util_csv)]
+    for flag, target in (("--out", fire_csv), ("--crosswalk", util_csv),
+                         ("--out", os.path.join(tmp, ".", "fire.csv"))):
+        code, out, err = run_cli(base + [flag, target, "--apply"])
+        check(code == 64 and "is also an input layer" in err,
+              "%s naming an input layer is refused  <-- pinned defect" % flag)
+    check(run_cli(base + ["--out", fire_csv])[0] == 64,
+          "and is refused on a dry run too, before --apply is added")
+    check(before == [open(p, "rb").read() for p in (fire_csv, util_csv)],
+          "and neither input layer was touched")
+    same_out = os.path.join(tmp, "same.csv")
+    code, out, err = run_cli(base + ["--out", same_out, "--crosswalk",
+                                     same_out, "--apply"])
+    check(code == 64 and "name the same file" in err
+          and not os.path.exists(same_out),
+          "--out and --crosswalk naming one file are refused and nothing is "
+          "written  <-- pinned defect")
+
+    # A character the console cannot encode must not turn a verdict into a
+    # crash. The reconfigure is proved in process, and the crash itself in a
+    # child whose stdout is piped through ascii.
+    calls = []
+
+    class Reconfigurable(io.StringIO):
+        def reconfigure(self, **kw):
+            calls.append(kw)
+
+    with contextlib.redirect_stdout(Reconfigurable()), \
+            contextlib.redirect_stderr(Reconfigurable()):
+        main(["--help"])
+    check(calls == [{"errors": "replace"}] * 2,
+          "main reconfigures stdout and stderr to replace what they cannot "
+          "encode")
+    uni_l = tmpfile("uni-l.csv", "ASSET_ID,X,Y\nH-\u0141 1,100000,100000\n")
+    uni_r = tmpfile("uni-r.csv", "ASSET_ID,X,Y\nH-\u0141 1,109000,100000\n")
+    child = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), uni_l, uni_r],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=dict(os.environ, PYTHONIOENCODING="ascii"))
+    check(child.returncode == 1 and b"H-? 1" in child.stdout
+          and b"Traceback" not in child.stderr
+          and b"VERDICT: 1 match(es) disproved" in child.stdout,
+          "a key the console cannot encode prints as ? and the verdict still "
+          "arrives, instead of a traceback and exit 1  <-- pinned defect")
+
+    # A crash is not a finding.
+    real_reconcile = globals()["reconcile"]
+
+    def boom(*args, **kw):
+        raise RuntimeError("probe")
+
+    try:
+        globals()["reconcile"] = boom
+        code, out, err = run_cli(base)
+    finally:
+        globals()["reconcile"] = real_reconcile
+    check(code == 70 and "unexpected RuntimeError: probe" in err
+          and "Traceback" in err and "VERDICT" not in out,
+          "an unexpected exception exits 70, not the 1 that means a match "
+          "was disproved  <-- pinned defect")
+
+    # The temp directory goes even when the body raises.
+    seen = []
+
+    def exploding(path):
+        seen.append(path)
+        raise RuntimeError("probe")
+
+    real_body = globals()["_self_test"]
+    try:
+        globals()["_self_test"] = exploding
+        try:
+            self_test()
+        except RuntimeError:
+            seen.append("raised")
+    finally:
+        globals()["_self_test"] = real_body
+    check(len(seen) == 2 and seen[1] == "raised"
+          and not os.path.exists(seen[0]),
+          "a self-test that raises still removes its temp directory  "
+          "<-- pinned defect")
 
     # ---- the harness itself. A check() that cannot record a failure would
     # report every defect above as a pass, which is the one failure no other
@@ -1994,15 +2432,50 @@ def self_test():
     check(buf.getvalue() == "" and imported.gate(imported.reconcile([], []))
           == 0, "importing the module prints nothing and exposes the core")
 
-    shutil.rmtree(tmp, ignore_errors=True)
-
     return summary(passed[0], failed)
 
 
 # ----------------------------------------------------------------------- cli
 
+class _Record(dict):
+    """One CSV row as a dict, plus the line of the file it starts on."""
+    line = None
+
+
+def _breaks(value):
+    """How many line breaks one parsed cell carries (a quoted newline)."""
+    cells = value if isinstance(value, list) else [value]
+    return sum(len(_BREAK.findall(c)) for c in cells if c)
+
+
+def looks_like_degrees(rows):
+    """True when every usable coordinate fits longitude and latitude.
+
+    Degrees exported into X and Y are the commonest wrong input, and they
+    fail silently: every pair is a fraction of a degree apart, so every pair
+    is CONFIRMED against a threshold of feet. A projected layer in feet or
+    metres leaves the +-180 and +-90 box at once; a local grid whose origin
+    is at the site can stay inside it, which --projected says is on purpose.
+    """
+    seen = False
+    for row in rows:
+        if row.x is None or row.y is None:
+            continue
+        seen = True
+        if abs(row.x) > 180.0 or abs(row.y) > 90.0:
+            return False
+    return seen
+
+
 def read_csv(path):
-    """Raw rows and the header of a CSV, as dicts."""
+    """Raw rows and the header of a CSV, as dicts with a .line attribute.
+
+    The line is the one the record starts on. DictReader skips a blank line
+    without saying so and counts a quoted field with a newline in it as one
+    row, so index + 2 drifts away from the file after either. The reader's own
+    line_num is the line the record ends on; the breaks inside its cells
+    walk it back to the start.
+    """
     # utf-8-sig, because Esri's Table To Table and Excel both write a UTF-8
     # BOM. Read as plain UTF-8 the first header cell arrives as a BOM with
     # HYDRANT_NO after it, the anchor column reads as absent on every row, and
@@ -2010,7 +2483,12 @@ def read_csv(path):
     with open(path, "r", newline="", encoding="utf-8-sig",
               errors="replace") as handle:
         reader = csv.DictReader(handle)
-        rows = list(reader)
+        rows = []
+        for raw in reader:
+            record = _Record(raw)
+            record.line = reader.line_num - sum(_breaks(v)
+                                                for v in raw.values())
+            rows.append(record)
         return rows, list(reader.fieldnames or [])
 
 
@@ -2065,7 +2543,7 @@ def extract_rows(raw_rows, side, fields):
                        "" if key is None else str(key).strip(),
                        to_number(raw.get(fields["x"])),
                        to_number(raw.get(fields["y"])),
-                       status, district))
+                       status, district, getattr(raw, "line", None)))
     return out
 
 
@@ -2146,6 +2624,10 @@ def _parse(argv):
                          "when it and a row on the other side are each the "
                          "other's nearest within this distance. Off unless "
                          "named.")
+    ap.add_argument("--projected", action="store_true",
+                    help="say that the coordinates are projected, to skip the "
+                         "check that refuses values that all fit longitude "
+                         "and latitude")
     ap.add_argument("--out", help="path for the classification CSV")
     ap.add_argument("--crosswalk",
                     help="path for the crosswalk CSV: one row per CONFIRMED, "
@@ -2171,7 +2653,40 @@ def _load(path, side, args):
     return extract_rows(raw_rows, side, fields)
 
 
+def _tolerate_odd_characters():
+    """Make print() unable to fail on a character the console cannot encode.
+
+    A piped stdout on Windows is cp1252, and a key or district read from a
+    file that is not UTF-8 arrives as U+FFFD, which cp1252 cannot write. The
+    UnicodeEncodeError then exits 1 and the VERDICT line is never printed.
+    A character that cannot be shown is printed as ? instead.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(errors="replace")
+
+
+def _same_file(a, b):
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(
+        os.path.realpath(b))
+
+
 def main(argv=None):
+    """Run the CLI. An error this code did not anticipate exits 70, because 1
+    is the code a scheduled job reads as 'a match was disproved'."""
+    _tolerate_odd_characters()
+    try:
+        return _run(argv)
+    except Exception as exc:
+        print("error: unexpected %s: %s. This is a fault in the tool, not a "
+              "finding about the data." % (type(exc).__name__, exc),
+              file=sys.stderr)
+        traceback.print_exc()
+        return 70
+
+
+def _run(argv):
     try:
         args = _parse(sys.argv[1:] if argv is None else argv)
     except SystemExit as exc:
@@ -2192,12 +2707,34 @@ def main(argv=None):
     if args.apply and not (args.out or args.crosswalk):
         print("error: --apply needs --out or --crosswalk.", file=sys.stderr)
         return 64
+    if args.right_status_field and not args.status_field:
+        # The right column would be required to exist and then never read.
+        print("error: --right-status-field needs --status-field for the left "
+              "side.", file=sys.stderr)
+        return 64
     if args.right_district_field and not args.district_field:
         # Only the right side would carry a district, so no pair could ever
         # disagree on one, and the run would look defended by a column it
         # never compared.
         print("error: --right-district-field needs --district-field for the "
               "left side.", file=sys.stderr)
+        return 64
+
+    outputs = [(flag, path) for flag, path in (("--out", args.out),
+                                               ("--crosswalk", args.crosswalk))
+               if path]
+    for flag, path in outputs:
+        # Checked on a dry run too: the run that would clobber a layer should
+        # say so before --apply is added, not after. The input is read in full
+        # before anything is written, and then it is gone.
+        for layer in (args.left, args.right):
+            if _same_file(path, layer):
+                print("error: %s %s is also an input layer. Name a new file."
+                      % (flag, path), file=sys.stderr)
+                return 64
+    if len(outputs) == 2 and _same_file(outputs[0][1], outputs[1][1]):
+        print("error: --out and --crosswalk name the same file, so the second "
+              "would replace the first.", file=sys.stderr)
         return 64
 
     try:
@@ -2214,8 +2751,12 @@ def main(argv=None):
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
-    print("idreuse: %s %d row(s), %s %d row(s)"
-          % (args.left, len(left), args.right, len(right)))
+    if not args.projected and looks_like_degrees(left + right):
+        print("error: every coordinate fits longitude -180..180 and latitude "
+              "-90..90, so these look like degrees. Distances in degrees mean "
+              "nothing against a threshold in feet. Project both layers, or "
+              "pass --projected if this is a local grid.", file=sys.stderr)
+        return 64
 
     try:
         report = reconcile(left, right, args.confirm_distance,
@@ -2227,6 +2768,10 @@ def main(argv=None):
         print("error: %s" % exc, file=sys.stderr)
         return 64
 
+    # After reconcile, so a usage error leaves stdout empty rather than
+    # looking like the start of a run that went well.
+    print("idreuse: %s %d row(s), %s %d row(s)"
+          % (args.left, len(left), args.right, len(right)))
     for line in lines:
         print(line)
 

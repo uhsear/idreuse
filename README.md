@@ -50,7 +50,7 @@ PASS  coordinates with thousands separators are UNVERIFIED, so the run exits 4 a
 ...
 PASS  198 of 200 rows with unreadable coordinates exit 4 and say how many pairs went unmeasured, instead of a clean exit 0  <-- pinned defect
 ...
-PASS  '7' on one side and 'D7' on the other share no value, so the column is refused and nothing is escalated  <-- pinned defect
+PASS  '7' on one side and 'D7' on the other share no value, so the column is refused, nothing is escalated and the run exits 4, not a clean 0  <-- pinned defect
 ...
 PASS  a blank line and a quoted newline do not move the reported line off the file  <-- pinned defect
 ...
@@ -79,6 +79,10 @@ PASS  stripping one apostrophe from a guarded cell returns every sample unchange
 ...
 PASS  --out guards the key column when the key starts with equals
 ...
+PASS  the CLI exits 4 when the district column is refused (codes D7 and D8) and a drift pair went unchecked  <-- pinned defect
+...
+PASS  a UTF-16 file exits 2 as an unreadable input on every Python version, not 64 on one and 2 on another  <-- pinned defect
+...
 PASS  the CLI writes =, + , - and @ keys as text, a numeric key as a number, and the input strips a leading tab or carriage return before the writer sees it  <-- pinned defect
 ...
 PASS  check() and raises() really do record a failure  <-- pinned defect
@@ -86,10 +90,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-590 assertions, 0 failed
+599 assertions, 0 failed
 ```
 
-The full run prints all 590 assertions. Each `...` line above is where this block is cut.
+The full run prints all 599 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -116,7 +120,7 @@ single-cell data.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 590 assertions on Windows (Python 3.13.2), on Python 3.9.25
+The self-test prints the same 599 assertions on Windows (Python 3.13.2), on Python 3.9.25
 and on Ubuntu (Python 3.12.3). All three outputs are identical line for line once the Windows carriage returns are stripped.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
 
@@ -424,6 +428,11 @@ The escalation is deliberately narrow:
   heading so a human can see it.
 - A pair with no coordinate stays `UNVERIFIED`. The district alone never condemns a match.
 - A blank district on either side is a hole in the data, not a move, so it escalates nothing.
+- A refused district column is not a clean run. When `--district-field` is set, the column is
+  refused (one value, blank, or the two sides share no code) and at least one pair is in the drift
+  band, the run exits 4 and the `VERDICT` says `INCOMPLETE`, because the check the operator asked
+  for could not run on those pairs. With no drift pair nothing needed the district, so the exit
+  stays 0. A disproved match still exits 1 first.
 - `--right-district-field` without `--district-field` exits 64. Only one side would carry a
   district, so no pair could ever disagree, and the run would look defended by a column it never
   compared. `--right-status-field` without `--status-field` exits 64 for the same reason.
@@ -538,9 +547,9 @@ left_key,right_key,tier,distance,left_line,right_line,left_district,right_distri
 |---|---|
 | 0 | At least one pair was measured, every pair on a shared key could be measured, at least half of the rows on the smaller layer found a partner, and no match was disproved by the geometry. |
 | 1 | At least one match was disproved, by distance or by district. Do not publish the join. |
-| 2 | A file could not be read, or `--out` or `--crosswalk` could not be written. |
+| 2 | A file could not be read, or `--out` or `--crosswalk` could not be written. A UTF-16 file, or a field longer than the `csv` module's 131072-character limit, lands here. |
 | 3 | Refused. The identifier is on more than one row, so nothing was compared. |
-| 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, or fewer than half of the rows on the smaller layer found a partner (`NOTHING COMPARED` or `INCOMPLETE`). Two layers with no rows land here too. |
+| 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, fewer than half of the rows on the smaller layer found a partner, or a refused district column left a drift pair unchecked (`NOTHING COMPARED` or `INCOMPLETE`). Two layers with no rows land here too. |
 | 64 | Usage error, including a column name that is not in the CSV, an unknown or abbreviated flag, an output path that is an input, and coordinates that look like degrees. |
 | 70 | An unexpected crash. This is a fault in the tool and not a finding. The traceback is on stderr. |
 
@@ -583,9 +592,11 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   different districts. The vocabulary check catches a column that shares nothing across the
   sides, or that never agrees. It does not catch two sides that share some values and differ on
   others, so make the codes match before the run.
-- The refusal of a single-value status or district column is a message only. A column with one
-  value can never make two sides disagree, so setting it aside changes no result. The vocabulary
-  refusal is different: it does stop the escalation.
+- The refusal of a single-value status column is a message only. A column with one value can
+  never make two sides disagree, so setting it aside changes no result. A refused district column
+  is different: it stops the escalation, so a run with a drift pair exits 4 (see "The district
+  signal"). The message for a single value counts the rows that hold a value, so a right side that
+  is mostly blank can say `all 3 row(s)` on a file with six.
 - A coordinate pair of exactly 0,0 is read as a missing point, because exports write it as a
   placeholder. That row is `UNVERIFIED`, so a pair with it on either side is listed as
   unmeasured and the run cannot exit 0. A real point at exactly 0,0, such as the origin of a
@@ -599,7 +610,9 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   reads as no coordinate.
 - Only UTF-8 CSV is supported; other encodings are decoded lossily without a warning. Bytes that
   are not UTF-8 become U+FFFD, and two different keys can collapse into one. A UTF-16 file is
-  rejected only because its column names are garbled, with exit 64. Save the CSV as UTF-8. Whether
+  refused with exit 2 and a message that names a NUL character, on every supported Python
+  version. Without that check Python 3.9 raises the same error and Python 3.13 reads the garbled
+  header and exits 64, so the tool tests the header for NUL itself. Save the CSV as UTF-8. Whether
   a given export tool writes a UTF-8 BOM was not verified against vendor documentation; the
   reader accepts a BOM and does not need one.
 - A character the console cannot show prints as `?` instead of stopping the run. The file the
@@ -634,7 +647,7 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   reliable in Excel once the file is saved and opened again, so treat the guard as one layer.
   The guard is not applied to the column names, which are fixed by the tool.
 - A key that is itself a plain signed number is written as a number and is not
-  apostrophe-guarded, unlike the xwddiff cell guard. A key such as `-7` is a plain number, so it
+  apostrophe-guarded, unlike the [xwddiff](https://github.com/uhsear/xwddiff) cell guard. A key such as `-7` is a plain number, so it
   is written as it came. A key that starts with a
   sign and is not a number, such as `-B`, gets the apostrophe. A consumer that joins on the key
   strips exactly one leading apostrophe that sits in front of `=`, `+`, `-`, `@`, tab, CR or LF
@@ -670,6 +683,12 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   is larger than the pipe buffer. A short run piped to `head -1` still returns the real verdict code.
 - An output that is a hard link to an input, or reaches it by an 8.3 short name, is not detected
   as the input. An existing `--out` or `--crosswalk` file is overwritten under `--apply`.
+- Exit 0 allows up to half of the smaller layer to have no usable ID. A row with a blank ID is
+  `UNVERIFIED`, not `UNMATCHED`, and the half-joined floor counts pairs only, so read the
+  `UNVERIFIED` count as well as the `UNMATCHED` one.
+- An interrupt (Ctrl-C) is not caught, so the exit code is the interpreter's own and not 70.
+- A zero-byte input file exits 64 with `columns not in the CSV ... (no columns at all)`, not 4.
+  The message names the cause. An export that has a header and no rows exits 4.
 - Exit 0 does not mean every row was checked. It means at least half of the smaller layer joined
   and every pair on a shared key could be measured. The `UNMATCHED` count shows how many rows
   never joined. The half is a fixed fraction, not derived from any data, so a run that joins just
@@ -706,3 +725,6 @@ Other single-file tools in this portfolio that pair with this one:
 - [roadmiles](https://github.com/uhsear/roadmiles) - the same refusal to certify a number nobody
   checked.
 - [fcload](https://github.com/uhsear/fcload) - load the reconciled result without corrupting it.
+- [xwddiff](https://github.com/uhsear/xwddiff) - classify the diff between two XML workspace
+  documents. Its cell guard for spreadsheet formulas is the one this tool's formula guard follows,
+  with the differences listed under Limits.

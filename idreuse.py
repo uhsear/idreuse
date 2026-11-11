@@ -193,8 +193,9 @@ class Report(object):
 
     def __init__(self, left, right, pairs, repeats, status_note, units,
                  confirm, reuse, candidates=(), district_note=None,
-                 rematch=None):
+                 rematch=None, district_refused=False):
         self.candidates = list(candidates)
+        self.district_refused = district_refused
         self.district_note = district_note
         self.rematch = rematch
         self.left = left
@@ -251,6 +252,16 @@ class Report(object):
         every one of its own rows, so it is not caught here."""
         smaller = min(len(self.left), len(self.right))
         return 2 * len(self.pairs) < smaller
+
+    @property
+    def district_unchecked(self):
+        """Drift pairs the district check was asked to judge and could not,
+        because the column was refused as a signal. Only a DRIFT pair is ever
+        escalated on a district, so with none of them nothing went unchecked.
+        Without this a refused column read as a clean run."""
+        if not self.district_refused:
+            return []
+        return [p for p in self.pairs if p.verdict == DRIFT]
 
     @property
     def unmeasured(self):
@@ -603,6 +614,7 @@ def reconcile(left, right, confirm=DEFAULT_CONFIRM_DISTANCE,
     right_by_key = dict((r.key, r) for r in right if r.key)
 
     district_note = None
+    district_refused = False
     if district_column:
         usable, district_note = district_signal(
             [r.district for r in list(left) + list(right)], district_column)
@@ -612,7 +624,7 @@ def reconcile(left, right, confirm=DEFAULT_CONFIRM_DISTANCE,
             if refusal:
                 usable, district_note = False, refusal
         if not usable:
-            district_column = None
+            district_refused, district_column = True, None
 
     status_note = None
     if status_column:
@@ -674,7 +686,8 @@ def reconcile(left, right, confirm=DEFAULT_CONFIRM_DISTANCE,
         candidates = rematch(left, right, rematch_distance, units)
 
     return Report(left, right, pairs, [], status_note, units, confirm, reuse,
-                  candidates, district_note, rematch_distance)
+                  candidates, district_note, rematch_distance,
+                  district_refused)
 
 
 def gate(report):
@@ -683,7 +696,8 @@ def gate(report):
         return 3
     if report.disproved:
         return 1
-    if report.compared_nothing or report.unmeasured or report.mostly_unjoined:
+    if (report.compared_nothing or report.unmeasured or report.mostly_unjoined
+            or report.district_unchecked):
         return 4
     return 0
 
@@ -800,6 +814,12 @@ def describe(report, sample=DEFAULT_SAMPLE):
                    "differently on the two sides."
                    % (len(report.pairs), min(len(report.left),
                                              len(report.right))))
+    elif report.district_unchecked:
+        out.append("VERDICT: INCOMPLETE. The district column was refused, so "
+                   "%d drift pair(s) were not checked against it. No measured "
+                   "match was disproved, and this is not a clean join. Make "
+                   "the district codes match on both sides and run again."
+                   % len(report.district_unchecked))
     else:
         out.append("VERDICT: no match was disproved by the geometry.")
     return out
@@ -2229,15 +2249,15 @@ def _self_test(tmp):
                       district_column="DISTRICT")
         check("share no value" in rep.district_note
               and [p.verdict for p in rep.pairs] == [DRIFT] * 3
-              and gate(rep) == 0,
+              and gate(rep) == 4,
               "'7' on one side and '%s' on the other share no value, so the "
-              "column is refused and nothing is escalated  "
-              "<-- pinned defect" % label)
+              "column is refused, nothing is escalated and the run exits 4, "
+              "not a clean 0  <-- pinned defect" % label)
     rep = dlayers(spread7, [("A", 0.0, 300.0, ""), ("B", 0.0, 300.0, ""),
                             ("C", 0.0, 300.0, "")],
                   district_column="DISTRICT")
     check("right side has no district value" in rep.district_note
-          and gate(rep) == 0,
+          and gate(rep) == 4,
           "a right column that is blank on every row is refused by name, "
           "not passed because the left side has two values  "
           "<-- pinned defect")
@@ -2256,7 +2276,7 @@ def _self_test(tmp):
                   [("A", 0.0, 300.0, "8"), ("B", 0.0, 300.0, "7")],
                   district_column="DISTRICT")
     check("no pair on a shared key has the same district" in rep.district_note
-          and gate(rep) == 0,
+          and gate(rep) == 4,
           "two columns that share values but never agree on a pair are "
           "refused  <-- pinned defect")
     rep = dlayers([("A", 0.0, 0.0, "7"), ("B", 0.0, 0.0, "8"),
@@ -2305,6 +2325,68 @@ def _self_test(tmp):
     check(not any(p.district_note for p in refused_d.pairs),
           "a refused district column leaves no pair carrying a district "
           "note")
+    vlines = describe(refused_d)
+    check(gate(refused_d) == 4 and len(refused_d.district_unchecked) == 3
+          and vlines[-1].startswith("VERDICT: INCOMPLETE. The district "
+                                    "column was refused, so 3 drift pair(s)")
+          and "not a clean join" in vlines[-1],
+          "a refused district column leaves its drift pairs unchecked, so "
+          "the run exits 4 and the VERDICT says INCOMPLETE, not 'no match "
+          "was disproved'  <-- pinned defect")
+    no_drift = dlayers([("A", 0.0, 0.0, "7"), ("B", 0.0, 0.0, "8")],
+                       [("A", 0.0, 10.0, "D7"), ("B", 0.0, 10.0, "D8")],
+                       district_column="DISTRICT")
+    check(no_drift.district_refused and no_drift.district_unchecked == []
+          and gate(no_drift) == 0
+          and describe(no_drift)[-1].startswith("VERDICT: no match was disp"),
+          "a refused district column with no drift pair stays exit 0, "
+          "because only a drift pair is ever escalated on it")
+    refused_hard = dlayers(
+        [("A", 0.0, 0.0, "7"), ("B", 0.0, 0.0, "8"), ("C", 0.0, 0.0, "7")],
+        [("A", 0.0, 900.0, "D7"), ("B", 0.0, 300.0, "D8"),
+         ("C", 0.0, 10.0, "D7")], district_column="DISTRICT")
+    check(refused_hard.district_unchecked != [] and gate(refused_hard) == 1,
+          "a disproved match still exits 1 when the district was refused")
+    check(dlayers(spread7, [("A", 0.0, 300.0, "7"), ("B", 0.0, 300.0, "8"),
+                            ("C", 0.0, 300.0, "7")],
+                  district_column="DISTRICT").district_unchecked == []
+          and dlayers(spread7, [("A", 0.0, 300.0, "7")],
+                      status_column=None).district_unchecked == [],
+          "a usable district column, or none asked for, leaves nothing "
+          "unchecked")
+    head_l = "ASSET_ID,X,Y,DISTRICT\n"
+    head_r = "ASSET_ID,X,Y,DIST\n"
+    dl = tmpfile("dist-l.csv", head_l + "K1,600000,700000,7\n"
+                 "K2,600000,700000,7\nK3,600000,700000,8\n")
+    dl_one = tmpfile("dist-l1.csv", head_l + "K1,600000,700000,7\n"
+                     "K2,600000,700000,7\nK3,600000,700000,7\n")
+    for label, left, body in (
+            ("codes D7 and D8", dl, "K1,600000,700010,D7\n"
+             "K2,600000,700300,D8\nK3,600000,700010,D8\n"),
+            ("a blank district", dl, "K1,600000,700010,\n"
+             "K2,600000,700300,\nK3,600000,700010,\n"),
+            ("one value on every row", dl_one, "K1,600000,700010,7\n"
+             "K2,600000,700300,7\nK3,600000,700010,7\n")):
+        dr = tmpfile("dist-r.csv", head_r + body)
+        code, out, err = run_cli([left, dr, "--district-field", "DISTRICT",
+                                  "--right-district-field", "DIST"])
+        check(code == 4 and "VERDICT: INCOMPLETE. The district column was "
+              "refused, so 1 drift pair(s)" in out,
+              "the CLI exits 4 when the district column is refused (%s) and "
+              "a drift pair went unchecked  <-- pinned defect" % label)
+    dr = tmpfile("dist-r.csv", head_r + "K1,600000,700010,7\n"
+                 "K2,600000,700300,8\nK3,600000,700010,8\n")
+    code, out, err = run_cli([dl, dr, "--district-field", "DISTRICT",
+                              "--right-district-field", "DIST"])
+    check(code == 1 and "K2" in out,
+          "the control with matching codes escalates the same drift pair to "
+          "REUSED and exits 1")
+    u16 = tmpfile("utf16.csv", "ASSET_ID,X,Y\nK1,600000,700000\n",
+                  encoding="utf-16")
+    code, out, err = run_cli([u16, u16])
+    check(code == 2 and "NUL" in err,
+          "a UTF-16 file exits 2 as an unreadable input on every Python "
+          "version, not 64 on one and 2 on another  <-- pinned defect")
     check(_few(set("abcde")) == "'a', 'b', 'c', 'd', 'e'"
           and _few(set("abcdef")) == "'a', 'b', 'c', 'd', 'e', ...",
           "a message lists five values and then says there are more")
@@ -2513,7 +2595,11 @@ def _self_test(tmp):
           "a positive one and a near miss are real coordinates")
 
     # An output may not be an input, or the other output.
-    before = [open(p, "rb").read() for p in (fire_csv, util_csv)]
+    def slurp(path):
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    before = [slurp(p) for p in (fire_csv, util_csv)]
     for flag, target in (("--out", fire_csv), ("--crosswalk", util_csv),
                          ("--out", os.path.join(tmp, ".", "fire.csv"))):
         code, out, err = run_cli(base + [flag, target, "--apply"])
@@ -2521,7 +2607,7 @@ def _self_test(tmp):
               "%s naming an input layer is refused  <-- pinned defect" % flag)
     check(run_cli(base + ["--out", fire_csv])[0] == 64,
           "and is refused on a dry run too, before --apply is added")
-    check(before == [open(p, "rb").read() for p in (fire_csv, util_csv)],
+    check(before == [slurp(p) for p in (fire_csv, util_csv)],
           "and neither input layer was touched")
     same_out = os.path.join(tmp, "same.csv")
     code, out, err = run_cli(base + ["--out", same_out, "--crosswalk",
@@ -2844,6 +2930,12 @@ def read_csv(path):
     with open(path, "r", newline="", encoding="utf-8-sig",
               errors="replace") as handle:
         reader = csv.DictReader(handle)
+        # Python 3.9 raises csv.Error on a NUL while 3.13 reads it, so a
+        # UTF-16 file would exit 2 on one and 64 on the other. Refuse it the
+        # same way on both, by its header.
+        if any("\x00" in name for name in reader.fieldnames or []):
+            raise csv.Error("line contains NUL: this file is not UTF-8 (is it "
+                            "UTF-16?). Save the CSV as UTF-8")
         rows = []
         for raw in reader:
             record = _Record(raw)

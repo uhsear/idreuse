@@ -51,15 +51,22 @@ PASS  two layers whose coordinates all fit longitude and latitude are refused, b
 PASS  a key the console cannot encode prints as ? and the verdict still arrives, instead of a traceback and exit 1  <-- pinned defect
 PASS  an unexpected exception exits 70, not the 1 that means a match was disproved  <-- pinned defect
 ...
+PASS  guard_cell puts one apostrophe in front of a cell that starts with carriage return
+PASS  guard_cell treats '-3x' as text, not as a number  <-- pinned defect
+PASS  stripping one apostrophe from a guarded cell returns every sample unchanged, apostrophes included  <-- pinned defect
+PASS  --out guards the key column when the key starts with equals
+...
+PASS  the CLI writes =, + , - and @ keys as text, a numeric key as a number, and the input strips a leading tab or carriage return before the writer sees it  <-- pinned defect
+...
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-420 assertions, 0 failed
+567 assertions, 0 failed
 ```
 
-The full run prints all 420 assertions. Each `...` line above is where this block is cut.
+The full run prints all 567 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -90,7 +97,7 @@ shows only that the search found nothing.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 420 assertions on Windows (Python 3.13.2), on Python 3.9.25
+The self-test prints the same 567 assertions on Windows (Python 3.13.2), on Python 3.9.25
 and on Ubuntu (Python 3.12.3). All three outputs are identical line for line.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
 
@@ -450,6 +457,44 @@ H-3,W-3,CANDIDATE,13.000,4,8,7,7,"13.0 ft between left line 4 (key 'H-3') and ri
 Without `--apply` the run prints `Check only. links.csv was not written. Re-run with --apply.`
 and writes nothing. `--out` works the same way, and one `--apply` writes both when both are named.
 
+## The formula guard
+
+`--out` and `--crosswalk` copy text from the two input layers: `key`, `left_key`, `right_key`,
+`left_district` and `right_district`. A spreadsheet runs a text cell as a formula when it starts
+with `=`, `+`, `-`, `@`, a tab or a carriage return. OWASP's
+[CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection) page lists those six, plus
+line feed and the full-width forms of the first four. Python's `csv` module writes a cell exactly
+as given, so before this guard a key of `=1+1` reached the file unchanged.
+
+Every text cell now goes through `guard_cell` in the one writer both files share, `_write_csv`:
+
+- A text cell that starts with one of those characters gets one leading apostrophe. `=1+1`
+  becomes `'=1+1`. The guard also covers line feed and the four full-width forms.
+- A plain number is left alone, so `-7`, `-1000.0` and `-1e-3` stay numbers. `x`, `y`,
+  `distance`, `csv_line`, `left_line` and `right_line` are never touched, and an integer is
+  returned as the integer.
+- A cell that already starts with an apostrophe in front of one of those characters gets one more,
+  so `'=x` is written as `''=x`. A consumer strips exactly one apostrophe, and only when what
+  follows is `'*` and then a formula character. The self-test pins that for 19 sample cells,
+  and pins that two different cells never guard to the same text.
+- The tool never reads its own output, so it has no strip-on-read to get wrong. `idreuse.py`
+  reads the two input layers only.
+- `--apply` is still the only thing that writes. A run with formula keys and no `--apply` writes
+  nothing, which the self-test checks.
+
+One case cannot happen on the command line. The input reader trims each key and each district, so
+a leading tab or carriage return never reaches the writer from a CSV. The self-test shows that, and
+it reaches the writer with tab and carriage return through `Row` objects built in the test.
+
+```
+$ python idreuse.py l.csv r.csv --crosswalk links.csv --apply
+...
+$ cat links.csv
+left_key,right_key,tier,distance,left_line,right_line,left_district,right_district,reason
+'=1+1,'=1+1,CONFIRMED,10.000,2,2,,,"10.0 ft apart, inside the confirm distance of 150.0"
+-7,-7,CONFIRMED,10.000,3,3,,,"10.0 ft apart, inside the confirm distance of 150.0"
+```
+
 ## Exit codes
 
 | Code | Meaning |
@@ -536,8 +581,14 @@ week. They do not make a run clean either: the run needs one measured pair.
   `--crosswalk` can fail, which leaves one file.
 - If `--apply` cannot write, the exit code is 2 even when matches were disproved. Read the printed
   `VERDICT`, which is above the error.
-- A key that starts with `=`, `+`, `-` or `@` is written as it came; open the output as text or
-  quote it first. A spreadsheet may read it as a formula.
+- The formula guard is checked on the CSV text, not in a spreadsheet application. No assertion
+  opens Excel or any other spreadsheet. OWASP itself warns that the apostrophe prefix is not
+  reliable in Excel once the file is saved and opened again, so treat the guard as one layer.
+  The guard is not applied to the column names, which are fixed by the tool.
+- A key such as `-7` is a plain number, so it is written as it came. A key that starts with a
+  sign and is not a number, such as `-B`, gets the apostrophe. A consumer that joins on the key
+  strips exactly one leading apostrophe that sits in front of `=`, `+`, `-`, `@`, tab, CR or LF
+  (see "The formula guard").
 - `--self-test` ignores every other valid flag, such as `--out` or `--apply`. It writes only to a
   temporary directory, which it removes at the end, even when an assertion raises.
 - It opens no socket and imports no network module, so there is no credential anywhere in it to

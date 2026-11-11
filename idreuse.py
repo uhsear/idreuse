@@ -110,6 +110,18 @@ ALL_CLASSES = CLASSES + (CANDIDATE,)
 # A line break inside a quoted cell, as csv itself counts them.
 _BREAK = re.compile(r"\r\n|\r|\n")
 
+# A spreadsheet runs a text cell as a formula when it starts with one of these
+# (OWASP, CSV Injection): = + - @ tab CR, plus LF and the full-width forms of
+# the first four, which some locales also read as formulas. The leading '*
+# keeps guard_cell reversible: a key that already starts with an apostrophe in
+# front of one of these gets one more, so a reader strips exactly one.
+_LEAD = r"=+\-@\t\r\n\uff1d\uff0b\uff0d\uff20"
+_GUARDED = re.compile("^'*[" + _LEAD + "]")
+# A plain number is never a formula, so a numeric column stays numeric. \Z,
+# not $: $ also matches before a final newline.
+_PLAIN_NUMBER = re.compile(
+    r"^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z")
+
 # The columns --out writes. This is a new file, not a copy of either input,
 # because there are two inputs and one of them has no row for half the keys.
 OUT_COLUMNS = ("side", "csv_line", "key", "class", "distance", "x", "y",
@@ -2373,6 +2385,137 @@ def _self_test(tmp):
           "a self-test that raises still removes its temp directory  "
           "<-- pinned defect")
 
+    # ---- the formula guard. --out and --crosswalk copy the key and the
+    # district text of the input layers, and a spreadsheet runs a text cell
+    # that starts with one of = + - @ tab CR as a formula. No assertion in
+    # this block opens a spreadsheet; each reads the raw CSV text back.
+    leads = [("equals", "=1+1"), ("plus", "+1+1"), ("minus", "-1+1"),
+             ("at", "@SUM(1)"), ("tab", "\tx"), ("carriage return", "\rx"),
+             ("line feed", "\nx"), ("full-width equals", "\uff1d1+1"),
+             ("full-width plus", "\uff0b1"), ("full-width minus", "\uff0d1"),
+             ("full-width at", "\uff20x")]
+    for name, text in leads:
+        check(guard_cell(text) == "'" + text,
+              "guard_cell puts one apostrophe in front of a cell that starts "
+              "with %s" % name)
+    for text in ("-3", "+3", "-1.5", "-.5", "+7.", "-1e-3", "42", "0", "abc",
+                 "", "O'Brien", "x=1", "a-b", " =x", "H-1"):
+        check(guard_cell(text) == text,
+              "guard_cell leaves %r alone: a number, or text that is not a "
+              "formula" % text)
+    for text in ("-3x", "-", "+", "-3\n", "-3\r", "- 3", "-1+2", "--3",
+                 "-3-"):
+        check(guard_cell(text) == "'" + text,
+              "guard_cell treats %r as text, not as a number  <-- pinned "
+              "defect" % text)
+    check(guard_cell(7) == 7 and guard_cell(None) is None
+          and guard_cell(-3) == -3,
+          "guard_cell returns an integer or None unchanged, so csv_line "
+          "stays an integer")
+
+    def strip_guard(cell):
+        """What a consumer of the CSV does: strip exactly one apostrophe
+        that sits in front of a formula character."""
+        return cell[1:] if re.match("^'+[" + _LEAD + "]", cell) else cell
+
+    samples = ["=1+1", "'=x", "''=x", "'hello", "'", "''", "'\t", "-5",
+               "'-5", "@a", "\tz", "\rz", "+", "", "plain", "\uff1dx", "-3\n",
+               "'-3\n", "H-1"]
+    check(all(strip_guard(guard_cell(t)) == t for t in samples),
+          "stripping one apostrophe from a guarded cell returns every sample "
+          "unchanged, apostrophes included  <-- pinned defect")
+    check(len(set(guard_cell(t) for t in samples)) == len(set(samples)),
+          "two different cells never guard to the same text, so a consumer "
+          "cannot confuse a key that started with an apostrophe with a "
+          "guarded one")
+
+    def raw_cells(path_):
+        with open(path_, "r", newline="", encoding="utf-8") as handle:
+            return list(csv.reader(handle))
+
+    def written_cells(name, writer, rep):
+        target = os.path.join(tmp, name)
+        writer(target, rep)
+        table = raw_cells(target)
+        return [dict(zip(table[0], r)) for r in table[1:]]
+
+    for index, (name, text) in enumerate(leads):
+        other_name, other = leads[(index + 1) % len(leads)]
+        left_row = Row(0, "left", text, -1000.0, -2000.5, None, text, 2)
+        right_row = Row(0, "right", text, -1000.0, -2010.5, None, other, 7)
+        rep = reconcile([left_row], [right_row])
+        out_back = written_cells("guard-out.csv", write_classified, rep)
+        walk_back = written_cells("guard-walk.csv", write_crosswalk, rep)
+        check(len(out_back) == 2 and len(walk_back) == 1,
+              "the %s key pairs, so both writers have a row to guard" % name)
+        check([r["key"] for r in out_back] == ["'" + text, "'" + text],
+              "--out guards the key column when the key starts with %s"
+              % name)
+        check(walk_back[0]["left_key"] == "'" + text,
+              "--crosswalk guards left_key when it starts with %s" % name)
+        check(walk_back[0]["right_key"] == "'" + text,
+              "--crosswalk guards right_key when it starts with %s" % name)
+        check(walk_back[0]["left_district"] == "'" + text,
+              "--crosswalk guards left_district when it starts with %s"
+              % name)
+        check(walk_back[0]["right_district"] == "'" + other,
+              "--crosswalk guards right_district when it starts with %s"
+              % other_name)
+        check([(r["x"], r["y"], r["csv_line"]) for r in out_back]
+              == [("-1000.0", "-2000.5", "2"), ("-1000.0", "-2010.5", "7")],
+              "the %s run writes negative x, y and csv_line as numbers  "
+              "<-- pinned defect" % name)
+        check((walk_back[0]["distance"], walk_back[0]["left_line"],
+               walk_back[0]["right_line"]) == ("10.000", "2", "7"),
+              "and the crosswalk distance and both lines stay numeric")
+
+    # every column of both files, for every leading character, so a column
+    # added later without a guard is caught here and not in a spreadsheet
+    for label, columns in (("--out", OUT_COLUMNS),
+                           ("--crosswalk", CROSSWALK_COLUMNS)):
+        for column in columns:
+            target = os.path.join(tmp, "guard-column.csv")
+            ok = True
+            for _name, text in leads:
+                _write_csv(target, columns, [dict((c, text) for c in columns)])
+                ok = ok and (raw_cells(target)[1][columns.index(column)]
+                             == "'" + text)
+            check(ok, "%s guards its %s column for every leading character"
+                  % (label, column))
+
+    # the real path: a CSV on disk, the CLI, --apply
+    formula_keys = ["=1+1", "+A", "-B", "@C", "-7", "\"\tT\"", "\"\rR\"",
+                    "plain"]
+    formula_head = "ASSET_ID,X,Y\n"
+    formula_left = tmpfile("formula-left.csv", formula_head + "".join(
+        "%s,-%d.0,-%d.0\n" % (k, 100 * (i + 1), 100 * (i + 1))
+        for i, k in enumerate(formula_keys)))
+    formula_right = tmpfile("formula-right.csv", formula_head + "".join(
+        "%s,-%d.0,-%d.0\n" % (k, 100 * (i + 1), 100 * (i + 1) + 10)
+        for i, k in enumerate(formula_keys)))
+    formula_out = os.path.join(tmp, "formula-out.csv")
+    formula_walk = os.path.join(tmp, "formula-walk.csv")
+    formula_argv = [formula_left, formula_right, "--out", formula_out,
+                    "--crosswalk", formula_walk]
+    code, out, err = run_cli(formula_argv)
+    check(code == 0 and not os.path.exists(formula_out)
+          and not os.path.exists(formula_walk),
+          "formula keys without --apply write nothing at all")
+    code, out, err = run_cli(formula_argv + ["--apply"])
+    check(code == 0 and os.path.exists(formula_out)
+          and os.path.exists(formula_walk),
+          "the same run with --apply writes both files")
+    expected = ["'=1+1", "'+A", "'-B", "'@C", "-7", "T", "R", "plain"]
+    out_table = raw_cells(formula_out)
+    walk_table = raw_cells(formula_walk)
+    check([r[out_table[0].index("key")] for r in out_table[1:9]] == expected,
+          "the CLI writes =, + , - and @ keys as text, a numeric key as a "
+          "number, and the input strips a leading tab or carriage return "
+          "before the writer sees it  <-- pinned defect")
+    check([r[0] for r in walk_table[1:]] == expected
+          and [r[1] for r in walk_table[1:]] == expected,
+          "and the crosswalk's left_key and right_key carry the same text")
+
     # ---- the harness itself. A check() that cannot record a failure would
     # report every defect above as a pass, which is the one failure no other
     # assertion here could see. The probe's own output is swallowed so a green
@@ -2547,12 +2690,28 @@ def extract_rows(raw_rows, side, fields):
     return out
 
 
+def guard_cell(value):
+    """The cell as written to CSV. A text cell that a spreadsheet would run as
+    a formula gets one leading apostrophe; a number, or anything that is not a
+    formula, is returned unchanged. Only a string is touched, so an integer
+    column such as csv_line stays an integer."""
+    if not isinstance(value, str):
+        return value
+    if _GUARDED.match(value) and not _PLAIN_NUMBER.match(value):
+        return "'" + value
+    return value
+
+
 def _write_csv(path, columns, rows):
+    """Write dict rows. Every text cell goes through guard_cell, because key,
+    left_key, right_key and both districts are copied from the input layers
+    and a spreadsheet would run =HYPERLINK(...) in one of them."""
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(columns))
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow(dict((name, guard_cell(value))
+                                 for name, value in row.items()))
 
 
 def write_classified(path, report):

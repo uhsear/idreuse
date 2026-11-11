@@ -66,6 +66,8 @@ PASS  a sentinel in both degrees layers is still refused as degrees, not called 
 ...
 PASS  a 0,0 placeholder on both sides is UNVERIFIED, not a CONFIRMED pair, and 0,0 against a real point is not REUSED  <-- pinned defect
 ...
+PASS  a -999999 or -9999 placeholder on both sides is UNVERIFIED, not a CONFIRMED pair at distance 0  <-- pinned defect
+...
 PASS  a key the console cannot encode prints as ? and the verdict still arrives, instead of a traceback and exit 1  <-- pinned defect
 PASS  an unexpected exception exits 70, not the 1 that means a match was disproved  <-- pinned defect
 ...
@@ -84,10 +86,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-588 assertions, 0 failed
+590 assertions, 0 failed
 ```
 
-The full run prints all 588 assertions. Each `...` line above is where this block is cut.
+The full run prints all 590 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -114,8 +116,8 @@ single-cell data.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 588 assertions on Windows (Python 3.13.2), on Python 3.9.25
-and on Ubuntu (Python 3.12.3). All three outputs are identical line for line.
+The self-test prints the same 590 assertions on Windows (Python 3.13.2), on Python 3.9.25
+and on Ubuntu (Python 3.12.3). All three outputs are identical line for line once the Windows carriage returns are stripped.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
 
 Both layers must already be in one projected CRS, in feet or in metres. The tool measures a
@@ -588,7 +590,10 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   placeholder. That row is `UNVERIFIED`, so a pair with it on either side is listed as
   unmeasured and the run cannot exit 0. A real point at exactly 0,0, such as the origin of a
   local grid, is treated the same way. A zero in only one axis is a real coordinate. Any other
-  placeholder, such as `-999999`, is read as a real number and pushes its pair far apart.
+  placeholder is read as a real number. A coordinate of exactly -9999, -99999, -999999 or -9999999 on
+  either axis is also read as a missing point, so a row with it on both sides is `UNVERIFIED` and
+  not a `CONFIRMED` pair at distance 0. The same values with a plus sign, and any other
+  placeholder, are read as real numbers and push their pair far apart.
 - A coordinate cell is read with Python `float()`, so underscores and Unicode digits are accepted
   as numbers. `1_000` reads as 1000. A thousands separator such as `1,000` is not a number and
   reads as no coordinate.
@@ -638,8 +643,24 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   temporary directory, which it removes at the end, even when an assertion raises.
 - A file written by `--out` or `--crosswalk` is not a valid input layer, because its text cells
   carry the formula-guard apostrophe. A guarded key such as `'=z` will not join to the key `=z`.
-- Only cells that begin with the listed characters are guarded. A cell that begins with
-  whitespace and then a formula character is written as it came.
+- Only the characters named in the formula guard are checked at the start of a cell; an invisible
+  character in front of them, such as a zero-width space, is not looked through, and whether a
+  spreadsheet runs such a cell as a formula was not tested.
+- The input reader trims leading whitespace from keys and districts, so a key such as ` =1` is
+  guarded as `=1`. The writer alone leaves a cell that begins with whitespace unchanged.
+- A key that is a plain signed number, such as -7, is not apostrophe-guarded, because a spreadsheet
+  reads it as a number and not as a formula. A key such as `1e5` or `00123` can still be
+  rewritten by the spreadsheet on open, so open `--out` and `--crosswalk` with the key column
+  formatted as text.
+- A `REUSED` pair whose rows are proposed as candidates by `--rematch-distance` is counted and
+  written as `CANDIDATE` in the report and in `--out`, but the pair still fails the gate: exit 1,
+  and the `VERDICT` line carries its count.
+- District escalation applies only to `DRIFT` pairs. A `CONFIRMED` pair across a district line
+  stays `CONFIRMED` and exits 0.
+- One self-test label starts with an uppercase word, `OPERABLE is 1 on all ten rows ...`, because
+  it names a column. That is a nit against the lowercase-label rule.
+- The self-test starts one child Python process on the tool itself to check the console encoding.
+  It still uses temporary files only, no network and no credentials.
 - Keys are printed as read. A key with an embedded newline or a terminal escape can make the
   report look odd, and keys are not sanitised for terminal escapes. The final `VERDICT` line and
   the exit code are not affected.

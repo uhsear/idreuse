@@ -2487,6 +2487,30 @@ def _self_test(tmp):
           == [(None, None), (0.0, 5.0), (7.0, 0.0)],
           "only the exact 0,0 pair is dropped; a zero in one axis is a "
           "real coordinate")
+    # A -999999 placeholder is a missing point too, not a point at distance 0.
+    nd_l = tmpfile("nd-l.csv", "ASSET_ID,X,Y\nH-1,620100.0,1580200.0\n"
+                   "H-2,-999999,-999999\nH-3,621000.0,1581000.0\n"
+                   "H-4,-9999,1580300.0\n")
+    nd_r = tmpfile("nd-r.csv", "ASSET_ID,X,Y\nH-1,620100.0,1580210.0\n"
+                   "H-2,-999999,-999999\nH-3,621000.0,1581000.0\n"
+                   "H-4,-9999,1580300.0\n")
+    code, out, err = run_cli([nd_l, nd_r, "--projected"])
+    check(code == 4 and "INCOMPLETE" in out and "H-2  left line 3" in out
+          and "H-4  left line 5" in out and "UNVERIFIED       4" in out
+          and "VERDICT: INCOMPLETE" in out,
+          "a -999999 or -9999 placeholder on both sides is UNVERIFIED, not "
+          "a CONFIRMED pair at distance 0  <-- pinned defect")
+    nd_rows = extract_rows([{"ID": "a", "X": "-9999", "Y": "5"},
+                            {"ID": "b", "X": "5", "Y": "-99999.0"},
+                            {"ID": "c", "X": "-9999999", "Y": "-9999999"},
+                            {"ID": "d", "X": "-9998", "Y": "5"},
+                            {"ID": "e", "X": "999999", "Y": "999999"}],
+                           "left", {"key": "ID", "x": "X", "y": "Y"})
+    check([(r.x, r.y) for r in nd_rows]
+          == [(None, None), (None, None), (None, None), (-9998.0, 5.0),
+              (999999.0, 999999.0)],
+          "a negative run of nines on either axis is a missing point; "
+          "a positive one and a near miss are real coordinates")
 
     # An output may not be an input, or the other output.
     before = [open(p, "rb").read() for p in (fire_csv, util_csv)]
@@ -2863,6 +2887,9 @@ def missing_columns(fields, header):
     return [name for name in names if name not in header]
 
 
+_NO_DATA = (-9999.0, -99999.0, -999999.0, -9999999.0)
+
+
 def extract_rows(raw_rows, side, fields):
     """Pull the four values this tool reasons about out of each CSV row."""
     out = []
@@ -2878,10 +2905,11 @@ def extract_rows(raw_rows, side, fields):
             district = "" if value is None else str(value).strip()
         x = to_number(raw.get(fields["x"]))
         y = to_number(raw.get(fields["y"]))
-        if x == 0.0 and y == 0.0:
-            # 0,0 is the placeholder an export writes for a missing point.
-            # Read as a real point, two layers that both use it report a
-            # CONFIRMED pair, and one against a real point reports REUSED.
+        if (x == 0.0 and y == 0.0) or x in _NO_DATA or y in _NO_DATA:
+            # 0,0 and a -9999 / -99999 / -999999 / -9999999 axis are the
+            # placeholders an export writes for a missing point. Read as a
+            # real point, two layers that both use one report a CONFIRMED
+            # pair at distance 0, and one against a real point reports REUSED.
             x = y = None
         out.append(Row(index, side,
                        "" if key is None else str(key).strip(),

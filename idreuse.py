@@ -1883,7 +1883,7 @@ def _self_test(tmp):
     check("rows classified" not in out and "CONFIRMED" not in out,
           "and nothing else is reported at all  <-- pinned defect")
 
-    # ---- the UTF-8 BOM that Excel and Table To Table both write
+    # ---- a UTF-8 BOM, which some export tools write
     bom_csv = tmpfile("fire-bom.csv", fire_text, encoding="utf-8-sig")
     bom_rows, bom_header = read_csv(bom_csv)
     check(bom_header[0] == "HYDRANT_NO",
@@ -2274,11 +2274,11 @@ def _self_test(tmp):
     check(Row(0, "left", "H-1", 0.0, 0.0, line=9).line == 9
           and Row(3, "left", "H-1", 0.0, 0.0).line == 5,
           "a row built with no line falls back to index + 2")
-    gap_l = tmpfile("gap-l.csv", 'ID,X,Y,NOTE\nH-1,0,0,"a\nb"\n\n\nH-3,0,0,x\n')
-    gap_r = tmpfile("gap-r.csv", "ID,X,Y\nH-3,0,9000\n")
+    gap_l = tmpfile("gap-l.csv", 'ID,X,Y,NOTE\nH-1,1,1,"a\nb"\n\n\nH-3,1,1,x\n')
+    gap_r = tmpfile("gap-r.csv", "ID,X,Y\nH-3,1,9000\n")
     code, out, err = run_cli([gap_l, gap_r, "--id-field", "ID",
                               "--projected"])
-    check("H-3  9000.0 ft apart, left line 6, right line 2" in out,
+    check("H-3  8999.0 ft apart, left line 6, right line 2" in out,
           "the report names the line the operator will find the row on  "
           "<-- pinned defect")
 
@@ -2360,6 +2360,7 @@ def _self_test(tmp):
     code, out, err = run_cli([deg_l, feet_r, "--projected"])
     check(code == 1 and "REUSED" in out,
           "and --projected overrides the mixed-unit refusal")
+
     check(looks_like_degrees([]) is False
           and looks_like_degrees([Row(0, "left", "a", None, None)]) is False
           and looks_like_degrees([Row(0, "left", "a", 10.0, 20.0)]) is True
@@ -2373,6 +2374,57 @@ def _self_test(tmp):
                                   Row(1, "left", "b", 10.0, None)]) is False,
           "the degrees check reads the box inclusively, skips an unreadable "
           "row, and needs a coordinate to judge")
+    sent_l = tmpfile("sent-l.csv", "ASSET_ID,X,Y\nH-1,-82.10,29.10\n"
+                     "H-2,-82.20,29.20\nH-9,-999999,-999999\n")
+    sent_r = tmpfile("sent-r.csv", "ASSET_ID,X,Y\nH-1,-81.50,29.80\n"
+                     "H-2,-81.60,29.70\nH-9,-999999,-999999\n")
+    for label, pair in (("a sentinel in both degrees layers", [sent_l, sent_r]),
+                        ("a sentinel on the left only", [sent_l, deg_r])):
+        code, out, err = run_cli(pair)
+        check(code == 64 and "look like degrees" in err and out == "",
+              "%s is still refused as degrees, not called CONFIRMED  "
+              "<-- pinned defect" % label)
+    blank_r = tmpfile("blank-r.csv", "ASSET_ID,X,Y\nH-1,,\n")
+    for pair in ([deg_l, blank_r], [blank_r, deg_l]):
+        code, out, err = run_cli(pair)
+        check(code == 64 and "look like degrees" in err
+              and "different units" not in err,
+              "degrees against a layer with no coordinates says degrees, not "
+              "different units  <-- pinned defect")
+    check(looks_like_degrees([Row(0, "left", "a", 10.0, 20.0),
+                              Row(1, "left", "b", 11.0, 21.0),
+                              Row(2, "left", "c", -999999.0, 0.5)]) is True
+          and looks_like_degrees([Row(0, "left", "a", 10.0, 20.0),
+                                  Row(1, "left", "b", 620100.0, 1580200.0),
+                                  Row(2, "left", "c", 620200.0, 1580300.0)])
+          is False,
+          "a degrees layer with one outlier is still degrees, and a projected "
+          "layer with one small pair is not  <-- pinned defect")
+    check(has_coordinates([]) is False
+          and has_coordinates([Row(0, "left", "a", 1.0, None)]) is False
+          and has_coordinates([Row(0, "left", "a", None, 1.0)]) is False
+          and has_coordinates([Row(0, "left", "a", 1.0, 1.0)]) is True,
+          "has_coordinates needs both an x and a y")
+
+    # 0,0 is the placeholder an export writes for a missing point.
+    zero_a = tmpfile("zero-a.csv", "ASSET_ID,X,Y\nH-1,0,0\n"
+                     "H-2,620100,1580200\nH-3,0.0,0.0\nH-4,0,5\n")
+    zero_b = tmpfile("zero-b.csv", "ASSET_ID,X,Y\nH-1,0,0\n"
+                     "H-2,620150,1580200\nH-3,620100,1580200\nH-4,0,5\n")
+    code, out, err = run_cli([zero_a, zero_b, "--projected"])
+    check(code == 4 and "INCOMPLETE" in out and "H-1  left line 2" in out
+          and "H-3  left line 4" in out and "REUSED           0" in out,
+          "a 0,0 placeholder on both sides is UNVERIFIED, not a CONFIRMED "
+          "pair, and 0,0 against a real point is not REUSED  "
+          "<-- pinned defect")
+    zero_rows = extract_rows([{"ID": "a", "X": "0", "Y": "0.0"},
+                              {"ID": "b", "X": "0", "Y": "5"},
+                              {"ID": "c", "X": "7", "Y": "0"}], "left",
+                             {"key": "ID", "x": "X", "y": "Y"})
+    check([(r.x, r.y) for r in zero_rows]
+          == [(None, None), (0.0, 5.0), (7.0, 0.0)],
+          "only the exact 0,0 pair is dropped; a zero in one axis is a "
+          "real coordinate")
 
     # An output may not be an input, or the other output.
     before = [open(p, "rb").read() for p in (fire_csv, util_csv)]
@@ -2664,22 +2716,31 @@ def _breaks(value):
 
 
 def looks_like_degrees(rows):
-    """True when every usable coordinate fits longitude and latitude.
+    """True when most usable coordinates fit longitude and latitude.
 
     Degrees exported into X and Y are the commonest wrong input, and they
     fail silently: every pair is a fraction of a degree apart, so every pair
     is CONFIRMED against a threshold of feet. A projected layer in feet or
     metres leaves the +-180 and +-90 box at once; a local grid whose origin
     is at the site can stay inside it, which --projected says is on purpose.
+    A strict majority decides, not all of them: a degrees layer with one
+    sentinel such as -999999 is still a degrees layer, and an all-or-nothing
+    test would let two such layers through as CONFIRMED.
     """
-    seen = False
+    inside = outside = 0
     for row in rows:
         if row.x is None or row.y is None:
             continue
-        seen = True
         if abs(row.x) > 180.0 or abs(row.y) > 90.0:
-            return False
-    return seen
+            outside += 1
+        else:
+            inside += 1
+    return inside > outside
+
+
+def has_coordinates(rows):
+    """True when at least one row has a usable x and y."""
+    return any(row.x is not None and row.y is not None for row in rows)
 
 
 def read_csv(path):
@@ -2691,9 +2752,8 @@ def read_csv(path):
     line_num is the line the record ends on; the breaks inside its cells
     walk it back to the start.
     """
-    # utf-8-sig, because Esri's Table To Table and Excel both write a UTF-8
-    # BOM. Read as plain UTF-8 the first header cell arrives as a BOM with
-    # HYDRANT_NO after it, the anchor column reads as absent on every row, and
+    # utf-8-sig, because some export tools write a UTF-8 BOM. Read as plain
+    # UTF-8 the first header cell arrives as a BOM with HYDRANT_NO after it, the anchor column reads as absent on every row, and
     # the run stops for a reason nothing in the output explains.
     with open(path, "r", newline="", encoding="utf-8-sig",
               errors="replace") as handle:
@@ -2754,11 +2814,16 @@ def extract_rows(raw_rows, side, fields):
         if fields.get("district"):
             value = raw.get(fields["district"])
             district = "" if value is None else str(value).strip()
+        x = to_number(raw.get(fields["x"]))
+        y = to_number(raw.get(fields["y"]))
+        if x == 0.0 and y == 0.0:
+            # 0,0 is the placeholder an export writes for a missing point.
+            # Read as a real point, two layers that both use it report a
+            # CONFIRMED pair, and one against a real point reports REUSED.
+            x = y = None
         out.append(Row(index, side,
                        "" if key is None else str(key).strip(),
-                       to_number(raw.get(fields["x"])),
-                       to_number(raw.get(fields["y"])),
-                       status, district, getattr(raw, "line", None)))
+                       x, y, status, district, getattr(raw, "line", None)))
     return out
 
 
@@ -2982,24 +3047,27 @@ def _run(argv):
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
-    if not args.projected and looks_like_degrees(left + right):
-        print("error: every coordinate fits longitude -180..180 and latitude "
-              "-90..90, so these look like degrees. Distances in degrees mean "
-              "nothing against a threshold in feet. Project both layers, or "
-              "pass --projected if this is a local grid.", file=sys.stderr)
-        return 64
-    if not args.projected and (looks_like_degrees(left)
-                               != looks_like_degrees(right)):
-        # Only one layer fits the box, and the check above did not fire, so the
-        # other layer has a coordinate outside it. One layer is in degrees and
-        # the other is projected: every pair would sit about a million feet
-        # apart and be called REUSED, a verdict the geometry never earned.
-        print("error: one layer looks like degrees (every coordinate fits "
-              "longitude -180..180 and latitude -90..90) and the other does "
-              "not, so the two are in different units and every distance "
-              "would be wrong. Project both layers to one CRS, or pass "
-              "--projected if one is a local grid.", file=sys.stderr)
-        return 64
+    if not args.projected:
+        deg_left, deg_right = looks_like_degrees(left), looks_like_degrees(right)
+        if deg_left != deg_right and has_coordinates(left)                 and has_coordinates(right):
+            # One layer fits the box and the other has a majority outside it:
+            # one is in degrees and the other is projected. Every pair would
+            # sit about a million feet apart and be called REUSED, a verdict
+            # the geometry never earned.
+            print("error: one layer looks like degrees (most coordinates fit "
+                  "longitude -180..180 and latitude -90..90) and the other "
+                  "does not, so the two are in different units and every "
+                  "distance would be wrong. Project both layers to one CRS, "
+                  "or pass --projected if one is a local grid.",
+                  file=sys.stderr)
+            return 64
+        if deg_left or deg_right:
+            print("error: most coordinates fit longitude -180..180 and "
+                  "latitude -90..90, so these look like degrees. Distances in "
+                  "degrees mean nothing against a threshold in feet. Project "
+                  "both layers, or pass --projected if this is a local grid.",
+                  file=sys.stderr)
+            return 64
 
     try:
         report = reconcile(left, right, args.confirm_distance,

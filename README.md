@@ -45,6 +45,8 @@ PASS  and never a REUSED, UNVERIFIED or UNMATCHED row  <-- pinned defect
 PASS  coordinates with thousands separators are UNVERIFIED, so the run exits 4 and does not call itself clean  <-- pinned defect
 PASS  198 of 200 rows with unreadable coordinates exit 4 and say how many pairs went unmeasured, instead of a clean exit 0  <-- pinned defect
 PASS  feet in one layer and degrees on the left are refused, not called REUSED  <-- pinned defect
+PASS  a sentinel in both degrees layers is still refused as degrees, not called CONFIRMED  <-- pinned defect
+PASS  a 0,0 placeholder on both sides is UNVERIFIED, not a CONFIRMED pair, and 0,0 against a real point is not REUSED  <-- pinned defect
 PASS  '7' on one side and 'D7' on the other share no value, so the column is refused and nothing is escalated  <-- pinned defect
 PASS  a blank line and a quoted newline do not move the reported line off the file  <-- pinned defect
 PASS  a candidate exactly at the rematch distance is found, the limit is inclusive  <-- pinned defect
@@ -65,10 +67,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-575 assertions, 0 failed
+583 assertions, 0 failed
 ```
 
-The full run prints all 575 assertions. Each `...` line above is where this block is cut.
+The full run prints all 583 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -95,16 +97,18 @@ single-cell data.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 575 assertions on Windows (Python 3.13.2), on Python 3.9.25
+The self-test prints the same 583 assertions on Windows (Python 3.13.2), on Python 3.9.25
 and on Ubuntu (Python 3.12.3). All three outputs are identical line for line.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
 
 Both layers must already be in one projected CRS, in feet or in metres. The tool measures a
 straight line between two points and converts nothing. Latitude and longitude give a number in
-degrees, which no threshold here can read. When every coordinate of both layers fits longitude
-(-180 to 180) and latitude (-90 to 90), the tool refuses the run and says the values look like
-degrees. A projected layer leaves that box at once. A local grid that really sits inside it
-needs `--projected`. When only one layer fits that box and the other does not, the two are in
+degrees, which no threshold here can read. When most coordinates of a layer fit longitude
+(-180 to 180) and latitude (-90 to 90), the tool calls that layer degrees. A strict majority
+decides, so one sentinel such as `-999999` in a degrees layer does not hide it. If a layer is
+degrees, the tool refuses the run and says the values look like degrees. A projected layer
+leaves that box at once. A local grid that really sits inside it needs `--projected`. When one
+layer is degrees and the other has coordinates and is not, the two are in
 different units (one in degrees, one projected). The tool refuses that run too, because every
 pair would sit about a million feet apart and be called `REUSED` for a reason that has nothing to
 do with the join. `--projected` overrides both refusals.
@@ -223,12 +227,16 @@ matches in the drift band, for a human to look at:
   H-6  350.0 ft apart, left line 7, right line 7
   H-2  300.0 ft apart, left line 3, right line 3
 
+pairs on a shared key with no separation to measure:
+  H-4  left line 5, right line 5
+
 VERDICT: 1 match(es) disproved by the geometry. Do not publish this join.
 ```
 
 Five keys were on both sides. `H-3` is the recycled number: its two rows are 250,000 feet apart,
-and the join is the tool that calls that a match. `H-6` looks like drift. The next section shows
-that it is not.
+and the join is the tool that calls that a match. `H-4` is on both sides, but the right row has
+blank coordinates, so the tool lists it as unmeasured instead of guessing. `H-6` looks like
+drift. The next section shows that it is not.
 
 The `left line` and `right line` numbers are the lines the records start on in their own files.
 A blank line or a quoted field that holds a line break does not shift them.
@@ -378,6 +386,9 @@ matches the geometry disproves, worst first:
 
 matches in the drift band, for a human to look at:
   H-2  300.0 ft apart, left line 3, right line 3
+
+pairs on a shared key with no separation to measure:
+  H-4  left line 5, right line 5
 
 pairs whose two sides are in different districts:
   H-3  the two sides are in different districts on DISTRICT: '7' on the left, '9' on the right
@@ -529,18 +540,20 @@ must be measurable.
   The degrees check is a guard against the commonest mistake, not a proof that the CRS is right.
 - Points only. A hydrant is a point. A line or a polygon has no single coordinate to compare, and
   centroid distance between two parcels would be a different tool with a different threshold.
-- `150` and `500` are the defaults, not a standard. They came from one measured pair of hydrant
-  layers where roughly four fifths of all ID-matched pairs fell inside 150 feet. Measure your own
-  pair, then set the two flags. Do not inherit these numbers because they are printed here.
+- `150` and `500` are the defaults, not a standard. The defaults 150 and 500 are starting points
+  and are not derived from a published dataset; measure your own layer pair and set both flags.
+  Do not inherit these numbers because they are printed here.
 - `--rematch-distance` has no default on purpose. Pick it from your own densest block: it must be
   shorter than the distance between two real neighbouring assets, or a tie will answer nobody.
 - The rematch compares every leftover row on one side with every leftover row on the other. One
   run of 3,000 random points a side with every row in the pool took about 8 seconds on a Windows
   workstation and 5 seconds on an Ubuntu server. The same layers without the rematch took under
-  0.3 seconds. These figures come from one workstation and one server, so yours will differ.
+  0.3 seconds. Rematch run times are one-off measurements on one workstation and one server and
+  will differ on yours.
 - If most rows are `UNMATCHED`, the rematch pool is most of the layer, and run time grows with
   the square of its size. This happens when the two sides spell the ID differently. A run of
-  10,000 random points a side took 95 seconds on the Windows workstation and printed no progress.
+  10,000 random points a side took 95 seconds in one run on the Windows workstation (a later run
+  took 74 seconds) and printed no progress.
   Fix the IDs first. The tool has no spatial index.
 - The district is read from a column. The tool does not intersect a point with a district
   polygon, so a district column that is stale is believed. Fill it with a spatial join first if
@@ -552,19 +565,22 @@ must be measurable.
 - The refusal of a single-value status or district column is a message only. A column with one
   value can never make two sides disagree, so setting it aside changes no result. The vocabulary
   refusal is different: it does stop the escalation.
-- A placeholder coordinate such as 0,0 is read as a real point; blank out missing coordinates
-  before running. Two layers that both fill missing coordinates with 0,0 report that pair
-  `CONFIRMED`, and a 0,0 against a real point reports `REUSED`.
+- A coordinate pair of exactly 0,0 is read as a missing point, because exports write it as a
+  placeholder. That row is `UNVERIFIED`, so a pair with it on either side is listed as
+  unmeasured and the run cannot exit 0. A real point at exactly 0,0, such as the origin of a
+  local grid, is treated the same way. A zero in only one axis is a real coordinate. Any other
+  placeholder, such as `-999999`, is read as a real number and pushes its pair far apart.
 - A coordinate cell is read with Python `float()`, so underscores and Unicode digits are accepted
   as numbers. `1_000` reads as 1000. A thousands separator such as `1,000` is not a number and
   reads as no coordinate.
 - Only UTF-8 CSV is supported; other encodings are decoded lossily without a warning. Bytes that
   are not UTF-8 become U+FFFD, and two different keys can collapse into one. A UTF-16 file is
-  rejected only because its column names are garbled, with exit 64. Save the CSV as UTF-8. In Excel
-  that is the separate "CSV UTF-8 (Comma delimited)" save type. The plain "CSV (Comma delimited)"
-  type uses the system code page.
+  rejected only because its column names are garbled, with exit 64. Save the CSV as UTF-8. Whether
+  a given export tool writes a UTF-8 BOM was not verified against vendor documentation; the
+  reader accepts a BOM and does not need one.
 - A character the console cannot show prints as `?` instead of stopping the run. The file the
-  tool writes is always UTF-8.
+  tool writes is always UTF-8 without a BOM, so import it as UTF-8 in Excel, or Excel may show
+  non-ASCII keys wrongly when you open it by double click.
 - Duplicate header names are not detected; the last column of that name is used. A short row has
   its missing cells read as blank, and a long row has its extra cells ignored.
 - The crosswalk is keyed on the pair of row keys and their CSV lines. A permanent asset number
@@ -592,7 +608,9 @@ must be measurable.
   opens Excel or any other spreadsheet. OWASP itself warns that the apostrophe prefix is not
   reliable in Excel once the file is saved and opened again, so treat the guard as one layer.
   The guard is not applied to the column names, which are fixed by the tool.
-- A key such as `-7` is a plain number, so it is written as it came. A key that starts with a
+- A key that is itself a plain signed number is written as a number and is not
+  apostrophe-guarded, unlike the xwddiff cell guard. A key such as `-7` is a plain number, so it
+  is written as it came. A key that starts with a
   sign and is not a number, such as `-B`, gets the apostrophe. A consumer that joins on the key
   strips exactly one leading apostrophe that sits in front of `=`, `+`, `-`, `@`, tab, CR or LF
   (see "The formula guard").
@@ -602,6 +620,20 @@ must be measurable.
   carry the formula-guard apostrophe. A guarded key such as `'=z` will not join to the key `=z`.
 - Only cells that begin with the listed characters are guarded. A cell that begins with
   whitespace and then a formula character is written as it came.
+- Keys are printed as read. A key with an embedded newline or a terminal escape can make the
+  report look odd, and keys are not sanitised for terminal escapes. The final `VERDICT` line and
+  the exit code are not affected.
+- A dry run does not test that the `--out` or `--crosswalk` path can be written, so a bad
+  directory shows up as exit 2 only after you add `--apply`.
+- Closing the output pipe early, for example piping to `head`, gives exit 70.
+- An output that is a hard link to an input, or reaches it by an 8.3 short name, is not detected
+  as the input. An existing `--out` or `--crosswalk` file is overwritten under `--apply`.
+- Exit 0 does not mean every row was checked. It means one pair was measured and every pair on a
+  shared key could be measured. Read the class counts: a run where almost every key failed to
+  join still exits 0 when one pair measures, and `UNMATCHED` is the count that shows it.
+- The tab and carriage return guards are exercised through rows built inside the self-test,
+  because the CSV reader trims a leading tab or carriage return from a key or district first.
+  The CLI path asserts the trimmed result.
 - It opens no socket and imports no network module, so there is no credential anywhere in it to
   leak.
 

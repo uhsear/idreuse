@@ -237,9 +237,16 @@ class Report(object):
 
     @property
     def compared_nothing(self):
-        """Rows were read, nothing was refused or disproved, and no pair was
-        measured. The join may be wrong and this run could not tell."""
-        return bool(self.total) and not self.refused and not self.measured
+        """Nothing was refused and no pair was measured, so the join may be
+        wrong and this run could not tell. Two layers with no rows land here
+        too: an export that came back empty is not a join that checked out."""
+        return not self.refused and not self.measured
+
+    @property
+    def unmeasured(self):
+        """Pairs on a shared key with no separation, because a coordinate was
+        blank or unreadable. The tool could not tell for these pairs."""
+        return [p for p in self.pairs if p.distance is None]
 
     def __repr__(self):
         if self.refused:
@@ -666,7 +673,7 @@ def gate(report):
         return 3
     if report.disproved:
         return 1
-    return 4 if report.compared_nothing else 0
+    return 4 if report.compared_nothing or report.unmeasured else 0
 
 
 def describe(report, sample=DEFAULT_SAMPLE):
@@ -743,6 +750,10 @@ def describe(report, sample=DEFAULT_SAMPLE):
         if len(notes) > sample:
             out.append("  ...and %d more" % (len(notes) - sample))
 
+    _section(out, "pairs on a shared key with no separation to measure:",
+             ["  %s  left line %d, right line %d"
+              % (p.key, p.left.line, p.right.line) for p in report.unmeasured],
+             sample)
     _section(out, "pairs whose two sides are in different districts:",
              ["  %s  %s" % (p.key, p.district_note)
               for p in report.pairs if p.district_note], sample)
@@ -762,6 +773,13 @@ def describe(report, sample=DEFAULT_SAMPLE):
                    "checked nothing. This is not a clean join. Look for an ID "
                    "spelled differently on the two sides, or for coordinates "
                    "this tool cannot read.")
+    elif report.unmeasured:
+        out.append("VERDICT: INCOMPLETE. %d of %d pair(s) on a shared key had "
+                   "no separation that could be measured, so the geometry "
+                   "checked only the rest. No measured match was disproved, "
+                   "and this is not a clean join. Fix the blank or unreadable "
+                   "coordinates and run again."
+                   % (len(report.unmeasured), len(report.pairs)))
     else:
         out.append("VERDICT: no match was disproved by the geometry.")
     return out
@@ -1150,8 +1168,9 @@ def _self_test(tmp):
     rep = layers([], [])
     check(rep.total == 0 and rep.classified == 0 and rep.pairs == [],
           "two empty layers classify nothing and crash on nothing")
-    check(gate(rep) == 0,
-          "and pass the gate: there is no match to disprove")
+    check(gate(rep) == 4,
+          "but exit 4, not 0: an empty export is not a join that checked out"
+          "  <-- pinned defect")
     rep = layers([("H-1", 0.0, 0.0, None)], [])
     check(rep.counts[UNMATCHED] == 1,
           "every row is UNMATCHED when the other side is empty")
@@ -1810,10 +1829,15 @@ def _self_test(tmp):
           "the drifting match is reported apart from the disproved one")
 
     code, out, err = run_cli(base + ["--reuse-distance", "300000"])
-    check(code == 0,
-          "a reuse distance past the worst pair passes the gate")
-    check("VERDICT: no match was disproved" in out,
-          "and says nothing was disproved")
+    check(code == 4 and "VERDICT: INCOMPLETE. 1 of 4 pair(s)" in out,
+          "a reuse distance past the worst pair disproves nothing, but the "
+          "pair with no coordinate keeps the run at exit 4, not 0"
+          "  <-- pinned defect")
+    check("no match was disproved by the geometry." not in out
+          and "pairs on a shared key with no separation to measure:\n"
+          "  H-4  left line 5, right line 5" in out,
+          "and the verdict does not call the join clean, and the pair it "
+          "could not measure is named with both lines")
     code, out, err = run_cli(base + ["--confirm-distance", "300",
                                      "--reuse-distance", "300"])
     check(("  %-11s %6d" % (DRIFT, 0)) in out,
@@ -2064,7 +2088,7 @@ def _self_test(tmp):
     try:
         sys.argv = ["idreuse.py", fire_csv, util_csv, "--id-field",
                     "HYDRANT_NO", "--reuse-distance", "300000"]
-        check(run_cli(None)[0] == 0,
+        check(run_cli(None)[0] == 4,
               "main with no argv reads the arguments after the program name")
     finally:
         sys.argv = argv_before
@@ -2086,8 +2110,45 @@ def _self_test(tmp):
           and "NOTHING COMPARED" in out,
           "an ID spelled H-1 on one side and H1 on the other pairs nothing, "
           "so the run exits 4  <-- pinned defect")
-    check(gate(layers([], [])) == 0 and not layers([], []).compared_nothing,
-          "two empty layers are not a failed comparison, there was no row")
+    check(gate(layers([], [])) == 4 and layers([], []).compared_nothing,
+          "two empty layers compared nothing, so they are not a clean run"
+          "  <-- pinned defect")
+    head_l = tmpfile("head-l.csv", "ASSET_ID,X,Y\n")
+    head_r = tmpfile("head-r.csv", "ASSET_ID,X,Y\n")
+    code, out, err = run_cli([head_l, head_r])
+    check(code == 4 and "rows classified: 0 of 0" in out
+          and "VERDICT: NOTHING COMPARED" in out
+          and "no match was disproved" not in out,
+          "two header-only layers exit 4 and do not call themselves clean"
+          "  <-- pinned defect")
+    part_l = tmpfile("part-l.csv", "ASSET_ID,X,Y\n" + "".join(
+        "H-%d,%d,%d\n" % (i, 600000 + i, 700000 + i) for i in range(1, 101)))
+    # H-1 is plain on the right; H-2 to H-100 carry a thousands separator.
+    part_r = tmpfile("part-r.csv", "ASSET_ID,X,Y\nH-1,600001,700001\n" +
+                     "".join('H-%d,"%s","%s"\n'
+                             % (i, "{:,}".format(600000 + i),
+                                "{:,}".format(700000 + i))
+                             for i in range(2, 101)))
+    code, out, err = run_cli([part_l, part_r])
+    check(code == 4 and "VERDICT: INCOMPLETE. 99 of 100 pair(s)" in out
+          and "no match was disproved by the geometry." not in out,
+          "198 of 200 rows with unreadable coordinates exit 4 and say how "
+          "many pairs went unmeasured, instead of a clean exit 0"
+          "  <-- pinned defect")
+    check("  H-2  left line 3, right line 3" in out
+          and "...and 89 more" in out,
+          "and the unmeasured pairs are listed with their lines, up to the "
+          "sample, and counted beyond it")
+    ws_l = tmpfile("ws-l.csv", "ASSET_ID,X,Y\n H-1,600100,700100\nH-2 ,600200,700200\n")
+    ws_r = tmpfile("ws-r.csv", "ASSET_ID,X,Y\nH-1,600100,700100\nH-2,600200,700200\n")
+    code, out, err = run_cli([ws_l, ws_r])
+    check(code == 0 and "pairs: 2 on a shared key" in out,
+          "a key with leading or trailing whitespace pairs with the trimmed "
+          "key, so both ends are trimmed, as the README says  "
+          "<-- pinned defect")
+    check(gate(layers([("H-1", 0.0, 0.0, None), ("H-2", None, None, None)],
+                      [("H-1", 0.0, 51.0, None), ("H-2", 0.0, 0.0, None)]))
+          == 4, "one unmeasured pair among measured ones also exits 4")
     check(layers([("H-1", 0.0, 0.0, None)],
                  [("H-1", 0.0, 9000.0, None)]).measured != [],
           "a measured pair is what separates a clean run from one that "
@@ -2215,7 +2276,8 @@ def _self_test(tmp):
           "a row built with no line falls back to index + 2")
     gap_l = tmpfile("gap-l.csv", 'ID,X,Y,NOTE\nH-1,0,0,"a\nb"\n\n\nH-3,0,0,x\n')
     gap_r = tmpfile("gap-r.csv", "ID,X,Y\nH-3,0,9000\n")
-    code, out, err = run_cli([gap_l, gap_r, "--id-field", "ID"])
+    code, out, err = run_cli([gap_l, gap_r, "--id-field", "ID",
+                              "--projected"])
     check("H-3  9000.0 ft apart, left line 6, right line 2" in out,
           "the report names the line the operator will find the row on  "
           "<-- pinned defect")
@@ -2288,6 +2350,16 @@ def _self_test(tmp):
     code, out, err = run_cli([deg_l, deg_r, "--projected"])
     check(code == 0 and "CONFIRMED" in out,
           "and --projected says they are a local grid and runs them")
+    feet_r = tmpfile("feet-r.csv", "ASSET_ID,X,Y\nH-1,600100,700100\n")
+    for label, pair in (("degrees on the left", [deg_l, feet_r]),
+                        ("degrees on the right", [feet_r, deg_l])):
+        code, out, err = run_cli(pair)
+        check(code == 64 and "different units" in err and out == "",
+              "feet in one layer and %s are refused, not called REUSED  "
+              "<-- pinned defect" % label)
+    code, out, err = run_cli([deg_l, feet_r, "--projected"])
+    check(code == 1 and "REUSED" in out,
+          "and --projected overrides the mixed-unit refusal")
     check(looks_like_degrees([]) is False
           and looks_like_degrees([Row(0, "left", "a", None, None)]) is False
           and looks_like_degrees([Row(0, "left", "a", 10.0, 20.0)]) is True
@@ -2573,7 +2645,7 @@ def _self_test(tmp):
     finally:
         sys.dont_write_bytecode = cache_before
     check(buf.getvalue() == "" and imported.gate(imported.reconcile([], []))
-          == 0, "importing the module prints nothing and exposes the core")
+          == 4, "importing the module prints nothing and exposes the core")
 
     return summary(passed[0], failed)
 
@@ -2915,6 +2987,18 @@ def _run(argv):
               "-90..90, so these look like degrees. Distances in degrees mean "
               "nothing against a threshold in feet. Project both layers, or "
               "pass --projected if this is a local grid.", file=sys.stderr)
+        return 64
+    if not args.projected and (looks_like_degrees(left)
+                               != looks_like_degrees(right)):
+        # Only one layer fits the box, and the check above did not fire, so the
+        # other layer has a coordinate outside it. One layer is in degrees and
+        # the other is projected: every pair would sit about a million feet
+        # apart and be called REUSED, a verdict the geometry never earned.
+        print("error: one layer looks like degrees (every coordinate fits "
+              "longitude -180..180 and latitude -90..90) and the other does "
+              "not, so the two are in different units and every distance "
+              "would be wrong. Project both layers to one CRS, or pass "
+              "--projected if one is a local grid.", file=sys.stderr)
         return 64
 
     try:

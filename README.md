@@ -43,6 +43,8 @@ PASS  the recycled number is proposed against its real partner, not the object i
 PASS  and never a REUSED, UNVERIFIED or UNMATCHED row  <-- pinned defect
 ...
 PASS  coordinates with thousands separators are UNVERIFIED, so the run exits 4 and does not call itself clean  <-- pinned defect
+PASS  198 of 200 rows with unreadable coordinates exit 4 and say how many pairs went unmeasured, instead of a clean exit 0  <-- pinned defect
+PASS  feet in one layer and degrees on the left are refused, not called REUSED  <-- pinned defect
 PASS  '7' on one side and 'D7' on the other share no value, so the column is refused and nothing is escalated  <-- pinned defect
 PASS  a blank line and a quoted newline do not move the reported line off the file  <-- pinned defect
 PASS  a candidate exactly at the rematch distance is found, the limit is inclusive  <-- pinned defect
@@ -63,10 +65,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-567 assertions, 0 failed
+575 assertions, 0 failed
 ```
 
-The full run prints all 567 assertions. Each `...` line above is where this block is cut.
+The full run prints all 575 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -88,16 +90,12 @@ nearest neighbours is an old idea outside GIS too.
 [mnnpy](https://github.com/chriscainx/mnnpy) uses it to match cells between batches of
 single-cell data.
 
-A search of GitHub for this combination (a join on a recycled ID, checked by the distance
-between the paired rows) found no other tool, other than this one, on the day it was run. That
-shows only that the search found nothing.
-
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 567 assertions on Windows (Python 3.13.2), on Python 3.9.25
+The self-test prints the same 575 assertions on Windows (Python 3.13.2), on Python 3.9.25
 and on Ubuntu (Python 3.12.3). All three outputs are identical line for line.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
 
@@ -106,7 +104,10 @@ straight line between two points and converts nothing. Latitude and longitude gi
 degrees, which no threshold here can read. When every coordinate of both layers fits longitude
 (-180 to 180) and latitude (-90 to 90), the tool refuses the run and says the values look like
 degrees. A projected layer leaves that box at once. A local grid that really sits inside it
-needs `--projected`.
+needs `--projected`. When only one layer fits that box and the other does not, the two are in
+different units (one in degrees, one projected). The tool refuses that run too, because every
+pair would sit about a million feet apart and be called `REUSED` for a reason that has nothing to
+do with the join. `--projected` overrides both refusals.
 
 ```
 git clone https://github.com/uhsear/idreuse.git
@@ -250,7 +251,7 @@ class would have been computed under a key that cannot say which of its two rows
 meant. A tool that reported them would be publishing an answer it already knows is unsound.
 
 **Refusal 2: a run that compared nothing.** A run is clean only when at least one pair on a
-shared key had a separation that could be measured. When rows were read and no pair was
+shared key had a separation that could be measured. When no pair was
 measured, the verdict says so and the exit code is 4. Two files whose IDs are spelled `H-001`
 and `H-1` show it:
 
@@ -278,9 +279,14 @@ $ echo $?
 4
 ```
 
-The same exit happens when every shared key has a blank or unreadable coordinate, and when one
-layer has a header and no rows while the other has rows. Two layers with no rows are not an error,
-because there was nothing to compare.
+The same exit happens when every shared key has a blank or unreadable coordinate, when one
+layer has a header and no rows while the other has rows, and when both layers have a header and no
+rows. An export that came back empty is not a join that checked out.
+
+When only some shared keys cannot be measured, the verdict is `INCOMPLETE` and the exit code is
+also 4. The run lists those pairs with their CSV lines. A layer pair of 100 hydrants where 99
+coordinates carry a thousands separator is not clean because one pair was measured. Fix the
+blank or unreadable coordinates and run again.
 
 ## Prove the signal exists
 
@@ -499,11 +505,11 @@ left_key,right_key,tier,distance,left_line,right_line,left_district,right_distri
 
 | Code | Meaning |
 |---|---|
-| 0 | At least one pair was measured and no match was disproved by the geometry. |
+| 0 | At least one pair was measured, every pair on a shared key could be measured, and no match was disproved by the geometry. |
 | 1 | At least one match was disproved, by distance or by district. Do not publish the join. |
 | 2 | A file could not be read, or `--out` or `--crosswalk` could not be written. |
 | 3 | Refused. The identifier is on more than one row, so nothing was compared. |
-| 4 | Nothing was compared. Rows were read and no pair on a shared key had a measurable separation. |
+| 4 | The run could not tell. No pair on a shared key had a measurable separation, or some pair had none (`NOTHING COMPARED` or `INCOMPLETE`). Two layers with no rows land here too. |
 | 64 | Usage error, including a column name that is not in the CSV, an unknown or abbreviated flag, an output path that is an input, and coordinates that look like degrees. |
 | 70 | An unexpected crash. This is a fault in the tool and not a finding. The traceback is on stderr. |
 
@@ -513,7 +519,8 @@ exit 0 for the same reason: "I checked and found nothing" and "I could not check
 
 `UNMATCHED`, `DRIFT` and `CANDIDATE` never fail the gate on their own. Half of any two-layer
 comparison is legitimately one-sided, and a tool that exited 1 on it would be ignored within a
-week. They do not make a run clean either: the run needs one measured pair.
+week. They do not make a run clean either: the run needs one measured pair, and every pair on a shared key
+must be measurable.
 
 ## Limits
 
@@ -563,7 +570,7 @@ week. They do not make a run clean either: the run needs one measured pair.
 - The crosswalk is keyed on the pair of row keys and their CSV lines. A permanent asset number
   that is a third column, distinct from the join key, is not read, and the crosswalk keeps no
   history between runs.
-- It compares identifiers verbatim. Trailing whitespace is trimmed and nothing else is: no case
+- It compares identifiers verbatim. Leading and trailing whitespace is trimmed and nothing else is: no case
   folding, no punctuation stripping, no leading-zero padding. If the two sides spell the
   identifier differently, settle that first with [nalmatch](https://github.com/uhsear/nalmatch)
   and come back. A run that pairs nothing exits 4 so that this cannot pass unseen.
@@ -591,6 +598,10 @@ week. They do not make a run clean either: the run needs one measured pair.
   (see "The formula guard").
 - `--self-test` ignores every other valid flag, such as `--out` or `--apply`. It writes only to a
   temporary directory, which it removes at the end, even when an assertion raises.
+- A file written by `--out` or `--crosswalk` is not a valid input layer, because its text cells
+  carry the formula-guard apostrophe. A guarded key such as `'=z` will not join to the key `=z`.
+- Only cells that begin with the listed characters are guarded. A cell that begins with
+  whitespace and then a formula character is written as it came.
 - It opens no socket and imports no network module, so there is no credential anywhere in it to
   leak.
 

@@ -34,11 +34,13 @@ different districts is escalated to REUSED. --rematch-distance proposes a
 CANDIDATE partner for a row the key could not pair, but only when each row is
 the other's single nearest. Nothing is written without --apply.
 
-Exit codes: 0 at least one pair was measured and no match was disproved, 1 at
-least one match was disproved, 2 a file could not be read or written, 3 the
-anchor was refused, 4 nothing was compared (rows were read and no pair on a
-shared key had a measurable separation), 64 usage error, 70 an unexpected
-crash, which is never a finding.
+Exit codes: 0 at least one pair was measured, every pair on a shared key could
+be measured, at least half of the smaller layer's rows found a partner, and no
+match was disproved, 1 at least one match was disproved, 2 a file could not be
+read or written, 3 the anchor was refused, 4 the run could not tell (no pair
+was measurable, some shared-key pair was unmeasurable, or fewer than half of
+the smaller layer's rows joined; INCOMPLETE or NOTHING COMPARED), 64 usage
+error, 70 an unexpected crash, which is never a finding.
 """
 
 from __future__ import print_function
@@ -62,10 +64,9 @@ import traceback
 # =============================================================================
 
 # Separation at or under which a matched pair is CONFIRMED, in the linear units
-# of the input CRS. 150 is set from one measured reconciliation of two hydrant
-# layers, where roughly four fifths of all ID-matched pairs fell inside it. It
-# is a survey-and-capture tolerance, not a statement about any asset class, so
-# measure your own pair before trusting it.
+# of the input CRS. 150 is an unpublished one-off measurement, not derived from
+# a published dataset. It is a survey-and-capture tolerance, not a statement
+# about any asset class, so measure your own pair before trusting it.
 DEFAULT_CONFIRM_DISTANCE = 150.0
 
 # Separation above which a matched pair is REUSED: too far apart to be one
@@ -241,6 +242,15 @@ class Report(object):
         wrong and this run could not tell. Two layers with no rows land here
         too: an export that came back empty is not a join that checked out."""
         return not self.refused and not self.measured
+
+    @property
+    def mostly_unjoined(self):
+        """Fewer than half of the smaller layer's rows found a partner. One
+        lucky shared key must not turn a join that failed on the rest into a
+        clean exit. A layer that is a true subset of the other still joins
+        every one of its own rows, so it is not caught here."""
+        smaller = min(len(self.left), len(self.right))
+        return 2 * len(self.pairs) < smaller
 
     @property
     def unmeasured(self):
@@ -673,7 +683,9 @@ def gate(report):
         return 3
     if report.disproved:
         return 1
-    return 4 if report.compared_nothing or report.unmeasured else 0
+    if report.compared_nothing or report.unmeasured or report.mostly_unjoined:
+        return 4
+    return 0
 
 
 def describe(report, sample=DEFAULT_SAMPLE):
@@ -780,6 +792,14 @@ def describe(report, sample=DEFAULT_SAMPLE):
                    "and this is not a clean join. Fix the blank or unreadable "
                    "coordinates and run again."
                    % (len(report.unmeasured), len(report.pairs)))
+    elif report.mostly_unjoined:
+        out.append("VERDICT: INCOMPLETE. Only %d of the %d rows on the smaller "
+                   "layer found a partner on a shared key, so the geometry "
+                   "checked only those. No measured match was disproved, and "
+                   "this is not a clean join. Look for an ID spelled "
+                   "differently on the two sides."
+                   % (len(report.pairs), min(len(report.left),
+                                             len(report.right))))
     else:
         out.append("VERDICT: no match was disproved by the geometry.")
     return out
@@ -1562,9 +1582,11 @@ def _self_test(tmp):
     check(rep.refused and rep.candidates == [] and rep.classified == 0,
           "a refused run rematches nothing")
     many = layers([("H-%d" % i, i * 1000.0, 0.0, None) for i in range(12)]
-                  + [("Z", 99000.0, 0.0, None)],
+                  + [("Z%d" % i, 99000.0 + i * 1000.0, 0.0, None)
+                     for i in range(13)],
                   [("W-%d" % i, i * 1000.0, 5.0, None) for i in range(12)]
-                  + [("Z", 99000.0, 5.0, None)], rematch_distance=50.0)
+                  + [("Z%d" % i, 99000.0 + i * 1000.0, 5.0, None)
+                     for i in range(13)], rematch_distance=50.0)
     lines = describe(many, sample=10)
     check(len(many.candidates) == 12
           and sum(1 for l in lines if " -> " in l) == 10
@@ -1572,6 +1594,30 @@ def _self_test(tmp):
           "candidates are sampled and counted like every other list")
     check(gate(many) == 0,
           "a CANDIDATE alone never fails the gate: it is a proposal")
+    lucky = layers([("L%d" % i, i * 1000.0, 0.0, None) for i in range(100)]
+                   + [("S1", 1.0, 1.0, None)],
+                   [("R%d" % i, i * 1000.0, 0.0, None) for i in range(100)]
+                   + [("S1", 1.0, 1.0, None)])
+    check(lucky.counts[UNMATCHED] == 200 and len(lucky.pairs) == 1
+          and not lucky.unmeasured and not lucky.disproved
+          and lucky.mostly_unjoined and gate(lucky) == 4,
+          "one lucky shared key among 200 unjoined rows is not clean, exit 4"
+          "  <-- pinned defect")
+    check("VERDICT: INCOMPLETE. Only 1 of the 101 rows on the smaller layer "
+          "found a partner" in describe(lucky)[-1],
+          "and the verdict names the join, not a clean result"
+          "  <-- pinned defect")
+    half = layers([("K%d" % i, i * 1000.0, 0.0, None) for i in range(4)],
+                  [("K%d" % i, i * 1000.0, 0.0, None) for i in range(2)]
+                  + [("Q%d" % i, 50000.0 + i * 1000.0, 0.0, None)
+                     for i in range(2)])
+    check(len(half.pairs) == 2 and not half.mostly_unjoined
+          and gate(half) == 0,
+          "exactly half of the smaller layer joined is still clean")
+    subset = layers([("K%d" % i, i * 1000.0, 0.0, None) for i in range(50)],
+                    [("K%d" % i, i * 1000.0, 0.0, None) for i in range(5)])
+    check(len(subset.pairs) == 5 and gate(subset) == 0,
+          "a layer that is a true subset of the other still exits 0")
     check(gate(layers([("H-0", 0.0, 0.0, None)], [("W-0", 0.0, 5.0, None)],
                       rematch_distance=50.0)) == 4,
           "but a CANDIDATE with no pair on a shared key compared nothing, "
@@ -1838,6 +1884,22 @@ def _self_test(tmp):
           "  H-4  left line 5, right line 5" in out,
           "and the verdict does not call the join clean, and the pair it "
           "could not measure is named with both lines")
+    NL = chr(10)
+
+    def spread(prefix, extra):
+        text = "ASSET_ID,X,Y" + NL
+        for i in range(100):
+            text += "%s%d,%d,500000" % (prefix, i, 500000 + i * 1000) + NL
+        return text + extra + NL
+
+    lucky_l = tmpfile("lucky_l.csv", spread("L", "S1,1000,1000"))
+    lucky_r = tmpfile("lucky_r.csv", spread("R", "S1,1000,1000"))
+    code, out, err = run_cli([lucky_l, lucky_r])
+    check(code == 4 and "VERDICT: INCOMPLETE. Only 1 of the 101 rows" in out
+          and "no match was disproved by the geometry." not in out
+          and "pairs: 1 on a shared key" in out,
+          "the CLI exits 4 when one lucky key joins among 200 unjoined rows"
+          "  <-- pinned defect")
     code, out, err = run_cli(base + ["--confirm-distance", "300",
                                      "--reuse-distance", "300"])
     check(("  %-11s %6d" % (DRIFT, 0)) in out,

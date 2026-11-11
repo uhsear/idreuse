@@ -2,7 +2,7 @@
 
 Reconcile two asset layers on a shared ID and refuse every match the geometry disproves. Refuses
 the ID itself when it is not unique, and refuses a status or district column that cannot carry a
-signal. Optionally proposes the real partner of a recycled ID, and writes a crosswalk of the
+signal. Optionally proposes a likely partner for a recycled ID, and writes a crosswalk of the
 links worth keeping.
 
 Two departments track the same fire hydrants. The fire side recycles a hydrant number when a
@@ -11,8 +11,8 @@ on that number. Most rows match, the join reports no error, and some of those ma
 live hydrant in one district to a retired record in another district entirely.
 
 Nobody catches it, because there is nothing to catch. The join did what it was told. The two
-rows agree on the only field the join compared, and the only evidence that the pair is wrong is
-the distance between the two points, which no join computes.
+rows agree on the only field the join compared, and the main evidence that the pair is wrong is
+the distance between the two points, which no join computes. A district or status column can add to it.
 
 The defence everybody reaches for first is the operable flag: compare only the live records. It
 removes nothing, because the flag is set on every row on both sides. The filter runs, the count
@@ -40,24 +40,41 @@ PASS  a drift pair whose sides are in different districts is REUSED  <-- pinned 
 ...
 PASS  the recycled number is proposed against its real partner, not the object its key points at  <-- pinned defect
 ...
+PASS  one lucky shared key among 200 unjoined rows is not clean, exit 4  <-- pinned defect
+...
 PASS  and never a REUSED, UNVERIFIED or UNMATCHED row  <-- pinned defect
 ...
+PASS  the CLI exits 4 when one lucky key joins among 200 unjoined rows  <-- pinned defect
+...
 PASS  coordinates with thousands separators are UNVERIFIED, so the run exits 4 and does not call itself clean  <-- pinned defect
+...
 PASS  198 of 200 rows with unreadable coordinates exit 4 and say how many pairs went unmeasured, instead of a clean exit 0  <-- pinned defect
-PASS  feet in one layer and degrees on the left are refused, not called REUSED  <-- pinned defect
-PASS  a sentinel in both degrees layers is still refused as degrees, not called CONFIRMED  <-- pinned defect
-PASS  a 0,0 placeholder on both sides is UNVERIFIED, not a CONFIRMED pair, and 0,0 against a real point is not REUSED  <-- pinned defect
+...
 PASS  '7' on one side and 'D7' on the other share no value, so the column is refused and nothing is escalated  <-- pinned defect
+...
 PASS  a blank line and a quoted newline do not move the reported line off the file  <-- pinned defect
+...
 PASS  a candidate exactly at the rematch distance is found, the limit is inclusive  <-- pinned defect
+...
 PASS  main returns the exit status of --self-test, so a red self-test fails CI  <-- pinned defect
+...
 PASS  two layers whose coordinates all fit longitude and latitude are refused, because 60 miles apart reads as CONFIRMED  <-- pinned defect
+...
+PASS  feet in one layer and degrees on the left are refused, not called REUSED  <-- pinned defect
+...
+PASS  a sentinel in both degrees layers is still refused as degrees, not called CONFIRMED  <-- pinned defect
+...
+PASS  a 0,0 placeholder on both sides is UNVERIFIED, not a CONFIRMED pair, and 0,0 against a real point is not REUSED  <-- pinned defect
+...
 PASS  a key the console cannot encode prints as ? and the verdict still arrives, instead of a traceback and exit 1  <-- pinned defect
 PASS  an unexpected exception exits 70, not the 1 that means a match was disproved  <-- pinned defect
 ...
 PASS  guard_cell puts one apostrophe in front of a cell that starts with carriage return
+...
 PASS  guard_cell treats '-3x' as text, not as a number  <-- pinned defect
+...
 PASS  stripping one apostrophe from a guarded cell returns every sample unchanged, apostrophes included  <-- pinned defect
+...
 PASS  --out guards the key column when the key starts with equals
 ...
 PASS  the CLI writes =, + , - and @ keys as text, a numeric key as a number, and the input strips a leading tab or carriage return before the writer sees it  <-- pinned defect
@@ -67,10 +84,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-583 assertions, 0 failed
+588 assertions, 0 failed
 ```
 
-The full run prints all 583 assertions. Each `...` line above is where this block is cut.
+The full run prints all 588 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -97,7 +114,7 @@ single-cell data.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 583 assertions on Windows (Python 3.13.2), on Python 3.9.25
+The self-test prints the same 588 assertions on Windows (Python 3.13.2), on Python 3.9.25
 and on Ubuntu (Python 3.12.3). All three outputs are identical line for line.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
 
@@ -162,9 +179,10 @@ Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--
 with exit 64 instead of being read as `--apply`, `--cross` is refused instead of being read as
 `--crosswalk`, and `--proj` is refused instead of being read as `--projected`.
 
-`--out` and `--crosswalk` must name new files. A path that is also an input layer, or that is
-the other output, is refused with exit 64, on a dry run too. Without that check `--apply` would
-replace a source layer with its own classification.
+`--out` and `--crosswalk` write only under `--apply`, and `--apply` replaces a file that already
+exists at that path. A path that is also an input layer, or that is the other output, is refused
+with exit 64, on a dry run too. Without that check `--apply` would replace a source layer with
+its own classification.
 
 ## What it checks
 
@@ -516,11 +534,11 @@ left_key,right_key,tier,distance,left_line,right_line,left_district,right_distri
 
 | Code | Meaning |
 |---|---|
-| 0 | At least one pair was measured, every pair on a shared key could be measured, and no match was disproved by the geometry. |
+| 0 | At least one pair was measured, every pair on a shared key could be measured, at least half of the rows on the smaller layer found a partner, and no match was disproved by the geometry. |
 | 1 | At least one match was disproved, by distance or by district. Do not publish the join. |
 | 2 | A file could not be read, or `--out` or `--crosswalk` could not be written. |
 | 3 | Refused. The identifier is on more than one row, so nothing was compared. |
-| 4 | The run could not tell. No pair on a shared key had a measurable separation, or some pair had none (`NOTHING COMPARED` or `INCOMPLETE`). Two layers with no rows land here too. |
+| 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, or fewer than half of the rows on the smaller layer found a partner (`NOTHING COMPARED` or `INCOMPLETE`). Two layers with no rows land here too. |
 | 64 | Usage error, including a column name that is not in the CSV, an unknown or abbreviated flag, an output path that is an input, and coordinates that look like degrees. |
 | 70 | An unexpected crash. This is a fault in the tool and not a finding. The traceback is on stderr. |
 
@@ -530,8 +548,9 @@ exit 0 for the same reason: "I checked and found nothing" and "I could not check
 
 `UNMATCHED`, `DRIFT` and `CANDIDATE` never fail the gate on their own. Half of any two-layer
 comparison is legitimately one-sided, and a tool that exited 1 on it would be ignored within a
-week. They do not make a run clean either: the run needs one measured pair, and every pair on a shared key
-must be measurable.
+week. They do not make a run clean either: the run needs one measured pair, every pair on a shared key
+must be measurable, and at least half of the rows on the smaller layer must find a partner. A layer
+that is a true subset of the other still joins all of its own rows, so it exits 0.
 
 ## Limits
 
@@ -580,7 +599,8 @@ must be measurable.
   reader accepts a BOM and does not need one.
 - A character the console cannot show prints as `?` instead of stopping the run. The file the
   tool writes is always UTF-8 without a BOM, so import it as UTF-8 in Excel, or Excel may show
-  non-ASCII keys wrongly when you open it by double click.
+  non-ASCII keys wrongly when you open it by double click. That Excel behaviour is not cited: the
+  Microsoft page on importing and exporting text files does not mention UTF-8 or a byte order mark.
 - Duplicate header names are not detected; the last column of that name is used. A short row has
   its missing cells read as blank, and a long row has its extra cells ignored.
 - The crosswalk is keyed on the pair of row keys and their CSV lines. A permanent asset number
@@ -625,15 +645,18 @@ must be measurable.
   the exit code are not affected.
 - A dry run does not test that the `--out` or `--crosswalk` path can be written, so a bad
   directory shows up as exit 2 only after you add `--apply`.
-- Closing the output pipe early, for example piping to `head`, gives exit 70.
+- Closing the output pipe early, for example piping to `head`, gives exit 70 only when the output
+  is larger than the pipe buffer. A short run piped to `head -1` still returns the real verdict code.
 - An output that is a hard link to an input, or reaches it by an 8.3 short name, is not detected
   as the input. An existing `--out` or `--crosswalk` file is overwritten under `--apply`.
-- Exit 0 does not mean every row was checked. It means one pair was measured and every pair on a
-  shared key could be measured. Read the class counts: a run where almost every key failed to
-  join still exits 0 when one pair measures, and `UNMATCHED` is the count that shows it.
+- Exit 0 does not mean every row was checked. It means at least half of the smaller layer joined
+  and every pair on a shared key could be measured. The `UNMATCHED` count shows how many rows
+  never joined. The half is a fixed fraction, not derived from any data, so a run that joins just
+  over half still exits 0 with much of the larger layer unjoined.
 - The tab and carriage return guards are exercised through rows built inside the self-test,
   because the CSV reader trims a leading tab or carriage return from a key or district first.
   The CLI path asserts the trimmed result.
+- The 0.5 join floor and the two default distances are unpublished choices, not standards.
 - It opens no socket and imports no network module, so there is no credential anywhere in it to
   leak.
 

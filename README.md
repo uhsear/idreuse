@@ -52,6 +52,10 @@ PASS  198 of 200 rows with unreadable coordinates exit 4 and say how many pairs 
 ...
 PASS  '7' on one side and 'D7' on the other share no value, so the column is refused, nothing is escalated and the run exits 4, not a clean 0  <-- pinned defect
 ...
+PASS  the CLI exits 4 when the district column is refused (codes D7 and D8) and a drift pair went unchecked  <-- pinned defect
+...
+PASS  a UTF-16 file exits 2 as an unreadable input on every Python version, not 64 on one and 2 on another  <-- pinned defect
+...
 PASS  a blank line and a quoted newline do not move the reported line off the file  <-- pinned defect
 ...
 PASS  a candidate exactly at the rematch distance is found, the limit is inclusive  <-- pinned defect
@@ -78,10 +82,6 @@ PASS  guard_cell treats '-3x' as text, not as a number  <-- pinned defect
 PASS  stripping one apostrophe from a guarded cell returns every sample unchanged, apostrophes included  <-- pinned defect
 ...
 PASS  --out guards the key column when the key starts with equals
-...
-PASS  the CLI exits 4 when the district column is refused (codes D7 and D8) and a drift pair went unchecked  <-- pinned defect
-...
-PASS  a UTF-16 file exits 2 as an unreadable input on every Python version, not 64 on one and 2 on another  <-- pinned defect
 ...
 PASS  the CLI writes =, + , - and @ keys as text, a numeric key as a number, and the input strips a leading tab or carriage return before the writer sees it  <-- pinned defect
 ...
@@ -120,8 +120,8 @@ single-cell data.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 599 assertions on Windows (Python 3.13.2), on Python 3.9.25
-and on Ubuntu (Python 3.12.3). All three outputs are identical line for line once the Windows carriage returns are stripped.
+The self-test prints the same 599 assertions on Windows (Python 3.13.2), on Linux with Python 3.9.25
+and on Ubuntu (Python 3.12.3). Python 3.9 was run on Linux only. All three outputs are identical line for line once the Windows carriage returns are stripped.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
 
 Both layers must already be in one projected CRS, in feet or in metres. The tool measures a
@@ -533,6 +533,14 @@ a leading tab or carriage return never reaches the writer from a CSV. The self-t
 it reaches the writer with tab and carriage return through `Row` objects built in the test.
 
 ```
+$ cat l.csv
+ASSET_ID,X,Y
+=1+1,100.0,100.0
+-7,300.0,300.0
+$ cat r.csv
+ASSET_ID,X,Y
+=1+1,110.0,100.0
+-7,300.0,310.0
 $ python idreuse.py l.csv r.csv --crosswalk links.csv --apply
 ...
 $ cat links.csv
@@ -661,15 +669,42 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   spreadsheet runs such a cell as a formula was not tested.
 - The input reader trims leading whitespace from keys and districts, so a key such as ` =1` is
   guarded as `=1`. The writer alone leaves a cell that begins with whitespace unchanged.
-- A key that is a plain signed number, such as -7, is not apostrophe-guarded, because a spreadsheet
-  reads it as a number and not as a formula. A key such as `1e5` or `00123` can still be
-  rewritten by the spreadsheet on open, so open `--out` and `--crosswalk` with the key column
+- A key such as `1e5` or `00123` can still be rewritten by the spreadsheet on open, so open `--out` and `--crosswalk` with the key column
   formatted as text.
 - A `REUSED` pair whose rows are proposed as candidates by `--rematch-distance` is counted and
   written as `CANDIDATE` in the report and in `--out`, but the pair still fails the gate: exit 1,
   and the `VERDICT` line carries its count.
 - District escalation applies only to `DRIFT` pairs. A `CONFIRMED` pair across a district line
   stays `CONFIRMED` and exits 0.
+- Compared with the [xwddiff](https://github.com/uhsear/xwddiff) cell guard, this guard is stricter
+  in three ways: it also guards line feed and the full-width forms, it doubles an apostrophe that
+  already stands in front of a formula character, and it exempts plain signed numbers. No weaker
+  rule hides behind it.
+- The guard checks only the first character of a cell. A key such as `A1;=1+1` is written
+  unquoted and unguarded, so a spreadsheet whose list separator is a semicolon can split it into
+  a new cell that starts with `=`.
+- OWASP names a second option, a tab prefix inside a quoted field, which resists the Excel
+  save-and-reopen problem better than an apostrophe. This tool does not use it.
+- Both layers must share one unit. The tool cannot detect a feet layer paired with a metres
+  layer, and the run prints a clean `VERDICT` if the numbers happen to agree.
+- A non-UTF-8 key on one side never pairs with the UTF-8 spelling on the other side, so it is
+  never measured. The exit code can still be 0 if enough other keys joined.
+- A row with more cells than the header keeps the cells by position, so an extra cell in the
+  middle of a row shifts the cells after it and the coordinates can be read from the wrong column.
+- A NUL byte below the header is refused on Python 3.9 with exit 2 and read as part of the key on
+  3.12 and later. Save the CSV as clean UTF-8 so every version agrees.
+- A `ValueError` raised from inside the comparison exits 64 like a usage error, so read the
+  stderr message before treating 64 as operator error.
+- A refused run prints the `REFUSED` block and, when `--out` or `--crosswalk` was named with
+  `--apply`, one more line saying the output was not written.
+- If the reader of standard output closes the pipe before the report is complete, the tool exits
+  70 and writes no output file, so a job that pipes the report and uses `--apply` gets no files.
+- A pipeline that feeds `--out` or `--crosswalk` back in as an input layer gets `UNMATCHED` rows
+  for every guarded key. The strip-on-read helper exists only inside the self-test.
+- The output files are UTF-8 with no byte order mark. Whether Excel misreads a non-ASCII key in
+  them was not tested.
+- Timings in this file are one-off measurements on one workstation and one server.
+- Coverage and `pyflakes` were run on Windows only. The Linux host has neither module installed.
 - One self-test label starts with an uppercase word, `OPERABLE is 1 on all ten rows ...`, because
   it names a column. That is a nit against the lowercase-label rule.
 - The self-test starts one child Python process on the tool itself to check the console encoding.

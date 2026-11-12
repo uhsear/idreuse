@@ -75,6 +75,13 @@ DEFAULT_CONFIRM_DISTANCE = 150.0
 # the band a human has to look at.
 DEFAULT_REUSE_DISTANCE = 500.0
 
+# A run where every measured pair sits more than this many times the reuse
+# distance apart is a CRS or linear-unit mismatch, not a layer full of recycled
+# IDs: one county cannot recycle two or more keys across hundreds of miles. At
+# the default reuse distance that is 500000 feet, about 95 miles. The run says
+# it could not tell and exits 4 instead of calling every pair REUSED.
+IMPLAUSIBLE_FACTOR = 1000
+
 # Printed after every distance. The tool never converts anything; this only
 # labels the units the coordinates already arrived in.
 DEFAULT_UNITS = "ft"
@@ -193,8 +200,9 @@ class Report(object):
 
     def __init__(self, left, right, pairs, repeats, status_note, units,
                  confirm, reuse, candidates=(), district_note=None,
-                 rematch=None, district_refused=False):
+                 rematch=None, district_refused=False, implausible=False):
         self.candidates = list(candidates)
+        self.implausible = implausible
         self.district_refused = district_refused
         self.district_note = district_note
         self.rematch = rematch
@@ -681,13 +689,39 @@ def reconcile(left, right, confirm=DEFAULT_CONFIRM_DISTANCE,
             row.verdict = UNMATCHED
             row.reason = "no row on the left side carries this key"
 
+    implausible = implausible_gaps(pairs, reuse)
+    if implausible:
+        # The geometry disproved nothing. It showed the layers do not share a
+        # coordinate system, so no pair may keep a verdict about the object.
+        for pair in pairs:
+            if pair.distance is None:
+                continue
+            pair.verdict = pair.left.verdict = pair.right.verdict = UNVERIFIED
+            pair.reason = pair.left.reason = pair.right.reason = (
+                "%.1f %s apart on every pair: a different CRS or linear "
+                "unit, not a recycled key" % (pair.distance, units))
+
     candidates = []
     if rematch_distance is not None:
         candidates = rematch(left, right, rematch_distance, units)
 
     return Report(left, right, pairs, [], status_note, units, confirm, reuse,
                   candidates, district_note, rematch_distance,
-                  district_refused)
+                  district_refused, implausible)
+
+
+def implausible_gaps(pairs, reuse):
+    """True when two or more pairs were measured and every one of them sits
+    more than IMPLAUSIBLE_FACTOR reuse distances apart.
+
+    One far pair can be a real recycled key. Every pair far is a layer in feet
+    against a layer in metres, or two different projections. A floor of the
+    default reuse distance keeps a reuse distance of zero from turning every
+    ordinary gap into a mismatch.
+    """
+    measured = [p for p in pairs if p.distance is not None]
+    limit = IMPLAUSIBLE_FACTOR * max(reuse, DEFAULT_REUSE_DISTANCE)
+    return len(measured) >= 2 and all(p.distance > limit for p in measured)
 
 
 def gate(report):
@@ -696,7 +730,7 @@ def gate(report):
         return 3
     if report.disproved:
         return 1
-    if (report.compared_nothing or report.unmeasured or report.mostly_unjoined
+    if (report.implausible or report.compared_nothing or report.unmeasured or report.mostly_unjoined
             or report.district_unchecked):
         return 4
     return 0
@@ -793,6 +827,14 @@ def describe(report, sample=DEFAULT_SAMPLE):
     if report.disproved:
         out.append("VERDICT: %d match(es) disproved by the geometry. Do not "
                    "publish this join." % len(report.disproved))
+    elif report.implausible:
+        out.append("VERDICT: UNITS OR CRS MISMATCH. Every one of the %d "
+                   "measured pairs sits more than %d times the reuse distance "
+                   "apart, so the two layers are not in one coordinate system "
+                   "or one linear unit (feet against metres, or two "
+                   "projections). No pair was judged, and this is not a clean "
+                   "join. Project both layers to one CRS and run again."
+                   % (len(report.measured), IMPLAUSIBLE_FACTOR))
     elif report.compared_nothing:
         out.append("VERDICT: NOTHING COMPARED. No pair on a shared key had a "
                    "separation that could be measured, so the geometry "
@@ -2504,6 +2546,64 @@ def _self_test(tmp):
     code, out, err = run_cli([deg_l, feet_r, "--projected"])
     check(code == 1 and "REUSED" in out,
           "and --projected overrides the mixed-unit refusal")
+
+    # Feet against metres is not a recycled key.
+    ft_two = tmpfile("ft-two.csv", "ASSET_ID,X,Y\nH-1,620100,1580200\n"
+                                   "H-2,620500,1580600\n")
+    m_two = tmpfile("m-two.csv", "ASSET_ID,X,Y\nH-1,188996,481601\n"
+                                 "H-2,189118,482378\n")
+    mism_out = os.path.join(tmp, "mismatch-out.csv")
+    code, out, err = run_cli([ft_two, m_two, "--out", mism_out, "--apply"])
+    with open(mism_out) as handle:
+        mism_text = handle.read()
+    check(code == 4 and "UNITS OR CRS MISMATCH" in out
+          and "Do not publish" not in out and "  REUSED" in out
+          and "REUSED           0" in out and "UNVERIFIED       4" in out
+          and "REUSED" not in mism_text.replace("class", ""),
+          "feet against metres, every pair over a thousand reuse distances "
+          "apart, exits 4 and says mismatch, not 'match(es) disproved' and "
+          "not REUSED  <-- pinned defect")
+    code, out, err = run_cli([ft_two, m_two, "--reuse-distance", "1500"])
+    check(code == 1 and "disproved" in out,
+          "a reuse distance of 1500 puts the limit past the gap, so the same "
+          "pairs are a finding: the limit scales with --reuse-distance")
+    near_two = tmpfile("near-two.csv", "ASSET_ID,X,Y\nH-1,188996,481601\n"
+                                       "H-2,620500,1580600\n")
+    code, out, err = run_cli([ft_two, near_two])
+    check(code == 1 and "disproved" in out and "MISMATCH" not in out,
+          "one pair far and one near is a finding, not a mismatch")
+    code, out, err = run_cli([ft_two, m_two, "--projected"])
+    check(code == 4 and "MISMATCH" in out,
+          "--projected does not hide a mismatch, it only skips the degrees "
+          "box")
+    one_far = tmpfile("one-far.csv", "ASSET_ID,X,Y\nH-1,188996,481601\n")
+    one_ft = tmpfile("one-ft.csv", "ASSET_ID,X,Y\nH-1,620100,1580200\n")
+    code, out, err = run_cli([one_ft, one_far])
+    check(code == 1 and "MISMATCH" not in out,
+          "a single far pair stays REUSED, because one can be a real "
+          "recycled key")
+    code, out, err = run_cli([ft_two, near_two, "--confirm-distance", "0",
+                              "--reuse-distance", "0"])
+    check(code == 1 and "MISMATCH" not in out,
+          "a reuse distance of zero does not turn every gap into a mismatch")
+    mixed = layers([("A", 0.0, 0.0, None), ("B", 0.0, 0.0, None),
+                    ("C", None, None, None)],
+                   [("A", 1e7, 0.0, None), ("B", 1e7, 0.0, None),
+                    ("C", 5.0, 5.0, None)])
+    check(mixed.implausible and mixed.counts[UNVERIFIED] == 6
+          and mixed.counts[REUSED] == 0 and gate(mixed) == 4
+          and "UNITS OR CRS MISMATCH" in " ".join(describe(mixed)),
+          "a mismatch with one blank-coordinate pair among the far ones still "
+          "judges no pair, and exits 4  <-- pinned defect")
+    gap_rows = [Row(0, "left", "a", 0.0, 0.0), Row(0, "right", "a", 1e7, 0.0)]
+    gap_pair = Pair("a", gap_rows[0], gap_rows[1], 1e7, REUSED, "far")
+    blank_pair = Pair("b", gap_rows[0], gap_rows[1], None, UNVERIFIED, "none")
+    check(implausible_gaps([gap_pair, gap_pair], 500.0) is True
+          and implausible_gaps([gap_pair, gap_pair, blank_pair], 500.0) is True
+          and implausible_gaps([gap_pair, blank_pair], 500.0) is False
+          and implausible_gaps([], 500.0) is False,
+          "implausible_gaps needs two measured pairs and ignores unmeasured "
+          "ones")
 
     check(looks_like_degrees([]) is False
           and looks_like_degrees([Row(0, "left", "a", None, None)]) is False

@@ -66,6 +66,8 @@ PASS  two layers whose coordinates all fit longitude and latitude are refused, b
 ...
 PASS  feet in one layer and degrees on the left are refused, not called REUSED  <-- pinned defect
 ...
+PASS  feet against metres, every pair over a thousand reuse distances apart, exits 4 and says mismatch, not 'match(es) disproved' and not REUSED  <-- pinned defect
+...
 PASS  a sentinel in both degrees layers is still refused as degrees, not called CONFIRMED  <-- pinned defect
 ...
 PASS  a 0,0 placeholder on both sides is UNVERIFIED, not a CONFIRMED pair, and 0,0 against a real point is not REUSED  <-- pinned defect
@@ -90,10 +92,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-599 assertions, 0 failed
+607 assertions, 0 failed
 ```
 
-The full run prints all 599 assertions. Each `...` line above is where this block is cut.
+The full run prints all 607 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -120,8 +122,9 @@ single-cell data.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 599 assertions on Windows (Python 3.13.2), on Linux with Python 3.9.25
-and on Ubuntu (Python 3.12.3). Python 3.9 was run on Linux only. All three outputs are identical line for line once the Windows carriage returns are stripped.
+The self-test prints the same 607 assertions on Windows with Python 3.13.2 and with Python 3.9.25,
+and on one Linux host (Ubuntu) with Python 3.12.3 and with Python 3.9.25. All four outputs are
+identical line for line once the Windows carriage returns are stripped.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
 
 Both layers must already be in one projected CRS, in feet or in metres. The tool measures a
@@ -135,6 +138,13 @@ layer is degrees and the other has coordinates and is not, the two are in
 different units (one in degrees, one projected). The tool refuses that run too, because every
 pair would sit about a million feet apart and be called `REUSED` for a reason that has nothing to
 do with the join. `--projected` overrides both refusals.
+
+Two projected layers can still disagree on the unit, one in feet and one in metres, or sit in two
+different projections. The degrees box cannot see that. When two or more pairs are measured and
+every one of them sits more than 1000 times the reuse distance apart (500000 feet at the default),
+the run does not call them `REUSED`. A county cannot recycle every key across hundreds of miles, so
+the cause is the layers. Every measured pair becomes `UNVERIFIED`, the `VERDICT` is
+`UNITS OR CRS MISMATCH`, and the exit code is 4. `--projected` does not turn this off.
 
 ```
 git clone https://github.com/uhsear/idreuse.git
@@ -557,7 +567,7 @@ left_key,right_key,tier,distance,left_line,right_line,left_district,right_distri
 | 1 | At least one match was disproved, by distance or by district. Do not publish the join. |
 | 2 | A file could not be read, or `--out` or `--crosswalk` could not be written. A UTF-16 file, or a field longer than the `csv` module's 131072-character limit, lands here. |
 | 3 | Refused. The identifier is on more than one row, so nothing was compared. |
-| 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, fewer than half of the rows on the smaller layer found a partner, or a refused district column left a drift pair unchecked (`NOTHING COMPARED` or `INCOMPLETE`). Two layers with no rows land here too. |
+| 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, fewer than half of the rows on the smaller layer found a partner, a refused district column left a drift pair unchecked (`NOTHING COMPARED` or `INCOMPLETE`), or every measured pair sat over 1000 reuse distances apart (`UNITS OR CRS MISMATCH`). Two layers with no rows land here too. |
 | 64 | Usage error, including a column name that is not in the CSV, an unknown or abbreviated flag, an output path that is an input, and coordinates that look like degrees. |
 | 70 | An unexpected crash. This is a fault in the tool and not a finding. The traceback is on stderr. |
 
@@ -677,16 +687,19 @@ that is a true subset of the other still joins all of its own rows, so it exits 
 - District escalation applies only to `DRIFT` pairs. A `CONFIRMED` pair across a district line
   stays `CONFIRMED` and exits 0.
 - Compared with the [xwddiff](https://github.com/uhsear/xwddiff) cell guard, this guard is stricter
-  in three ways: it also guards line feed and the full-width forms, it doubles an apostrophe that
-  already stands in front of a formula character, and it exempts plain signed numbers. No weaker
-  rule hides behind it.
+  in two ways: it also guards line feed and the full-width forms, and it doubles an apostrophe that
+  already stands in front of a formula character. It is looser in one way: it leaves a plain signed
+  number such as `-7` or `+3` unguarded, where xwddiff `cell()` prefixes every text cell that starts
+  with `=`, `+`, `-`, `@`, tab or CR. That exemption is a deliberate choice, not a stricter rule.
 - The guard checks only the first character of a cell. A key such as `A1;=1+1` is written
   unquoted and unguarded, so a spreadsheet whose list separator is a semicolon can split it into
   a new cell that starts with `=`.
 - OWASP names a second option, a tab prefix inside a quoted field, which resists the Excel
   save-and-reopen problem better than an apostrophe. This tool does not use it.
-- Both layers must share one unit. The tool cannot detect a feet layer paired with a metres
-  layer, and the run prints a clean `VERDICT` if the numbers happen to agree.
+- Both layers must share one unit. The tool detects a feet layer paired with a metres layer only
+  when two or more pairs are measured and every one of them is over 1000 reuse distances apart. A
+  single pair, or a mismatch that puts some pairs close together, is not detected. If the numbers
+  happen to agree, the run prints a clean `VERDICT`.
 - A non-UTF-8 key on one side never pairs with the UTF-8 spelling on the other side, so it is
   never measured. The exit code can still be 0 if enough other keys joined.
 - A row with more cells than the header keeps the cells by position, so an extra cell in the
@@ -734,6 +747,12 @@ that is a true subset of the other still joins all of its own rows, so it exits 
 - The 0.5 join floor and the two default distances are unpublished choices, not standards.
 - It opens no socket and imports no network module, so there is no credential anywhere in it to
   leak.
+- A CSV that is not UTF-8 is decoded with replacement characters, so two different keys that differ
+  only in a non-UTF-8 byte read as one key and can pair falsely, and can be called `CONFIRMED` with
+  exit 0. Save both layers as UTF-8.
+- Run time grows with the square of the row count when a status or district column has many
+  distinct values, because the signal check keeps a list of the values it has seen. A few thousand
+  rows is fast. Naming such a column on 20,000 rows a side took 9.4 seconds in one run.
 
 ## Contributing
 

@@ -68,6 +68,8 @@ PASS  feet in one layer and degrees on the left are refused, not called REUSED  
 ...
 PASS  feet against metres, every pair over a thousand reuse distances apart, exits 4 and says mismatch, not 'match(es) disproved' and not REUSED  <-- pinned defect
 ...
+PASS  a reuse distance under the floor still uses the floored limit  <-- pinned defect
+...
 PASS  a sentinel in both degrees layers is still refused as degrees, not called CONFIRMED  <-- pinned defect
 ...
 PASS  a 0,0 placeholder on both sides is UNVERIFIED, not a CONFIRMED pair, and 0,0 against a real point is not REUSED  <-- pinned defect
@@ -92,10 +94,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-607 assertions, 0 failed
+610 assertions, 0 failed
 ```
 
-The full run prints all 607 assertions. Each `...` line above is where this block is cut.
+The full run prints all 610 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -122,7 +124,7 @@ single-cell data.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 607 assertions on Windows with Python 3.13.2 and with Python 3.9.25,
+The self-test prints the same 610 assertions on Windows with Python 3.13.2 and with Python 3.9.25,
 and on one Linux host (Ubuntu) with Python 3.12.3 and with Python 3.9.25. All four outputs are
 identical line for line once the Windows carriage returns are stripped.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
@@ -141,10 +143,12 @@ do with the join. `--projected` overrides both refusals.
 
 Two projected layers can still disagree on the unit, one in feet and one in metres, or sit in two
 different projections. The degrees box cannot see that. When two or more pairs are measured and
-every one of them sits more than 1000 times the reuse distance apart (500000 feet at the default),
-the run does not call them `REUSED`. A county cannot recycle every key across hundreds of miles, so
+every one of them sits more than 1000 times the reuse distance apart, the run does not call them `REUSED`. A county cannot recycle every key across hundreds of miles, so
 the cause is the layers. Every measured pair becomes `UNVERIFIED`, the `VERDICT` is
-`UNITS OR CRS MISMATCH`, and the exit code is 4. `--projected` does not turn this off.
+`UNITS OR CRS MISMATCH`, and the exit code is 4. `--projected` does not turn this off. For this
+test the reuse distance counts as at least 500, so the limit is 500000 feet at the default and for
+any `--reuse-distance` below 500. A larger reuse distance raises it in proportion. The `VERDICT`
+line prints the limit it used.
 
 ```
 git clone https://github.com/uhsear/idreuse.git
@@ -567,7 +571,7 @@ left_key,right_key,tier,distance,left_line,right_line,left_district,right_distri
 | 1 | At least one match was disproved, by distance or by district. Do not publish the join. |
 | 2 | A file could not be read, or `--out` or `--crosswalk` could not be written. A UTF-16 file, or a field longer than the `csv` module's 131072-character limit, lands here. |
 | 3 | Refused. The identifier is on more than one row, so nothing was compared. |
-| 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, fewer than half of the rows on the smaller layer found a partner, a refused district column left a drift pair unchecked (`NOTHING COMPARED` or `INCOMPLETE`), or every measured pair sat over 1000 reuse distances apart (`UNITS OR CRS MISMATCH`). Two layers with no rows land here too. |
+| 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, fewer than half of the rows on the smaller layer found a partner, a refused district column left a drift pair unchecked (`NOTHING COMPARED` or `INCOMPLETE`), or every measured pair sat over the mismatch limit apart (`UNITS OR CRS MISMATCH`, 1000 times the reuse distance, at least 500000 feet). Two layers with no rows land here too. |
 | 64 | Usage error, including a column name that is not in the CSV, an unknown or abbreviated flag, an output path that is an input, and coordinates that look like degrees. |
 | 70 | An unexpected crash. This is a fault in the tool and not a finding. The traceback is on stderr. |
 
@@ -697,7 +701,7 @@ that is a true subset of the other still joins all of its own rows, so it exits 
 - OWASP names a second option, a tab prefix inside a quoted field, which resists the Excel
   save-and-reopen problem better than an apostrophe. This tool does not use it.
 - Both layers must share one unit. The tool detects a feet layer paired with a metres layer only
-  when two or more pairs are measured and every one of them is over 1000 reuse distances apart. A
+  when two or more pairs are measured and every one of them is over the mismatch limit apart, which is 1000 times the reuse distance but never under 500000 feet. A
   single pair, or a mismatch that puts some pairs close together, is not detected. If the numbers
   happen to agree, the run prints a clean `VERDICT`.
 - A non-UTF-8 key on one side never pairs with the UTF-8 spelling on the other side, so it is
@@ -718,12 +722,11 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   them was not tested.
 - Timings in this file are one-off measurements on one workstation and one server.
 - Coverage and `pyflakes` were run on Windows only. The Linux host has neither module installed.
-- One self-test label starts with an uppercase word, `OPERABLE is 1 on all ten rows ...`, because
-  it names a column. That is a nit against the lowercase-label rule.
 - The self-test starts one child Python process on the tool itself to check the console encoding.
   It still uses temporary files only, no network and no credentials.
 - Keys are printed as read. A key with an embedded newline or a terminal escape can make the
-  report look odd, and keys are not sanitised for terminal escapes. The final `VERDICT` line and
+  report look odd, and keys are not sanitised for terminal escapes. An escape sequence in a key can recolour the
+  screen or clear it, which hides report lines above the `VERDICT`. The final `VERDICT` line and
   the exit code are not affected.
 - A dry run does not test that the `--out` or `--crosswalk` path can be written, so a bad
   directory shows up as exit 2 only after you add `--apply`.

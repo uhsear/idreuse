@@ -38,8 +38,10 @@ Exit codes: 0 at least one pair was measured, every pair on a shared key could
 be measured, at least half of the smaller layer's rows found a partner, and no
 match was disproved, 1 at least one match was disproved, 2 a file could not be
 read or written, 3 the anchor was refused, 4 the run could not tell (no pair
-was measurable, some shared-key pair was unmeasurable, or fewer than half of
-the smaller layer's rows joined; INCOMPLETE or NOTHING COMPARED), 64 usage
+was measurable, some shared-key pair was unmeasurable, fewer than half of
+the smaller layer's rows joined, a refused district column left a drift pair
+unchecked, or every measured pair sat implausibly far apart; NOTHING COMPARED,
+INCOMPLETE or UNITS OR CRS MISMATCH), 64 usage
 error, 70 an unexpected crash, which is never a finding.
 """
 
@@ -78,8 +80,10 @@ DEFAULT_REUSE_DISTANCE = 500.0
 # A run where every measured pair sits more than this many times the reuse
 # distance apart is a CRS or linear-unit mismatch, not a layer full of recycled
 # IDs: one county cannot recycle two or more keys across hundreds of miles. At
-# the default reuse distance that is 500000 feet, about 95 miles. The run says
-# it could not tell and exits 4 instead of calling every pair REUSED.
+# the default reuse distance that is 500000 feet, about 95 miles. The reuse
+# distance is floored at the default for this test, so a smaller --reuse-distance
+# still uses 500000 feet. The run says it could not tell and exits 4 instead of
+# calling every pair REUSED.
 IMPLAUSIBLE_FACTOR = 1000
 
 # Printed after every distance. The tool never converts anything; this only
@@ -710,6 +714,11 @@ def reconcile(left, right, confirm=DEFAULT_CONFIRM_DISTANCE,
                   district_refused, implausible)
 
 
+def implausible_limit(reuse):
+    """Separation above which a pair counts as a mismatch gap, in layer units."""
+    return IMPLAUSIBLE_FACTOR * max(reuse, DEFAULT_REUSE_DISTANCE)
+
+
 def implausible_gaps(pairs, reuse):
     """True when two or more pairs were measured and every one of them sits
     more than IMPLAUSIBLE_FACTOR reuse distances apart.
@@ -720,7 +729,7 @@ def implausible_gaps(pairs, reuse):
     ordinary gap into a mismatch.
     """
     measured = [p for p in pairs if p.distance is not None]
-    limit = IMPLAUSIBLE_FACTOR * max(reuse, DEFAULT_REUSE_DISTANCE)
+    limit = implausible_limit(reuse)
     return len(measured) >= 2 and all(p.distance > limit for p in measured)
 
 
@@ -829,12 +838,14 @@ def describe(report, sample=DEFAULT_SAMPLE):
                    "publish this join." % len(report.disproved))
     elif report.implausible:
         out.append("VERDICT: UNITS OR CRS MISMATCH. Every one of the %d "
-                   "measured pairs sits more than %d times the reuse distance "
-                   "apart, so the two layers are not in one coordinate system "
-                   "or one linear unit (feet against metres, or two "
-                   "projections). No pair was judged, and this is not a clean "
+                   "measured pairs sits more than %.0f %s apart (%d times the "
+                   "reuse distance, floored at %.0f), so the two layers are "
+                   "not in one coordinate system or one linear unit (feet "
+                   "against metres, or two projections). No pair was judged, and this is not a clean "
                    "join. Project both layers to one CRS and run again."
-                   % (len(report.measured), IMPLAUSIBLE_FACTOR))
+                   % (len(report.measured), implausible_limit(report.reuse),
+                      report.units, IMPLAUSIBLE_FACTOR,
+                      DEFAULT_REUSE_DISTANCE))
     elif report.compared_nothing:
         out.append("VERDICT: NOTHING COMPARED. No pair on a shared key had a "
                    "separation that could be measured, so the geometry "
@@ -1979,7 +1990,7 @@ def _self_test(tmp):
     # ---- the status column, through the CLI, on the layers from the story
     code, out, err = run_cli(base + ["--status-field", "OPERABLE"])
     check("refused as a status signal" in out,
-          "OPERABLE is 1 on all ten rows, so it is refused as a signal"
+          "the OPERABLE column is 1 on all ten rows, so it is refused as a signal"
           "  <-- pinned defect")
     check("'OPERABLE'" in out and "'1'" in out,
           "and the refusal names the column and the value")
@@ -2598,6 +2609,28 @@ def _self_test(tmp):
     gap_rows = [Row(0, "left", "a", 0.0, 0.0), Row(0, "right", "a", 1e7, 0.0)]
     gap_pair = Pair("a", gap_rows[0], gap_rows[1], 1e7, REUSED, "far")
     blank_pair = Pair("b", gap_rows[0], gap_rows[1], None, UNVERIFIED, "none")
+    check(implausible_limit(0.0) == 500000.0 and implausible_limit(100.0)
+          == 500000.0 and implausible_limit(500.0) == 500000.0
+          and implausible_limit(1500.0) == 1500000.0,
+          "the mismatch limit is 1000 times the reuse distance, floored at "
+          "1000 times the default  <-- pinned defect")
+    near_gap = Pair("a", gap_rows[0], gap_rows[1], 200000.0, REUSED, "far")
+    check(implausible_gaps([near_gap, near_gap], 100.0) is False
+          and implausible_gaps([gap_pair, gap_pair], 100.0) is True,
+          "a reuse distance under the floor still uses the floored limit  "
+          "<-- pinned defect")
+    floored = layers([("A", 0.0, 0.0, None), ("B", 0.0, 0.0, None)],
+                     [("A", 200000.0, 0.0, None), ("B", 200000.0, 0.0, None)],
+                     reuse=100.0, confirm=50.0)
+    far_mism = layers([("A", 0.0, 0.0, None), ("B", 0.0, 0.0, None)],
+                 [("A", 6e5, 0.0, None), ("B", 6e5, 0.0, None)], reuse=100.0,
+                 confirm=50.0)
+    check(not floored.implausible and gate(floored) == 1
+          and far_mism.implausible and gate(far_mism) == 4
+          and "more than 500000 ft apart (1000 times the reuse distance, "
+              "floored at 500)" in " ".join(describe(far_mism)),
+          "the verdict names the limit it used when the reuse distance is "
+          "below the floor  <-- pinned defect")
     check(implausible_gaps([gap_pair, gap_pair], 500.0) is True
           and implausible_gaps([gap_pair, gap_pair, blank_pair], 500.0) is True
           and implausible_gaps([gap_pair, blank_pair], 500.0) is False

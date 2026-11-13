@@ -42,6 +42,8 @@ PASS  the recycled number is proposed against its real partner, not the object i
 ...
 PASS  one lucky shared key among 200 unjoined rows is not clean, exit 4  <-- pinned defect
 ...
+PASS  a row with no ID is UNVERIFIED, so the run exits 4 and not 0  <-- pinned defect
+...
 PASS  and never a REUSED, UNVERIFIED or UNMATCHED row  <-- pinned defect
 ...
 PASS  the CLI exits 4 when one lucky key joins among 200 unjoined rows  <-- pinned defect
@@ -96,17 +98,19 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-612 assertions, 0 failed
+617 assertions, 0 failed
 ```
 
-The full run prints all 612 assertions. Each `...` line above is where this block is cut.
+The full run prints all 617 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
 The join itself is a solved problem. A pandas `merge` with `indicator=True` adds a `_merge`
 column that says whether each row came from the left side, the right side or both
 ([pandas.merge](https://pandas.pydata.org/docs/reference/api/pandas.merge.html)). ArcGIS Add
-Join and a SQL `LEFT JOIN` match the rows just as correctly. None of them measures the distance
+Join and a SQL `LEFT JOIN` match the rows just as correctly. Add Join matches a record "when the
+input field and join field values are equal"
+([Add Join](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/add-join.htm)). None of them measures the distance
 between the two rows they paired, so none of them can say a match is wrong.
 
 The rematch is not new either. ArcGIS Pro's
@@ -126,7 +130,7 @@ single-cell data.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 612 assertions on Windows with Python 3.13.2 and with Python 3.9.25,
+The self-test prints the same 617 assertions on Windows with Python 3.13.2 and with Python 3.9.25,
 and on one Linux host (Ubuntu) with Python 3.12.3 and with Python 3.9.25. All four outputs are
 identical line for line once the Windows carriage returns are stripped.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
@@ -145,7 +149,7 @@ do with the join. `--projected` overrides both refusals.
 
 Two projected layers can still disagree on the unit, one in feet and one in metres, or sit in two
 different projections. The degrees box cannot see that. When two or more pairs are measured and
-every one of them sits more than 1000 times the reuse distance apart, the run does not call them `REUSED`. A county cannot recycle every key across hundreds of miles, so
+every one of them sits more than 1000 times the reuse distance apart, the run does not call them `REUSED`. An asset owner cannot recycle every key across hundreds of miles, so
 the cause is the layers. Every measured pair becomes `UNVERIFIED`, the `VERDICT` is
 `UNITS OR CRS MISMATCH`, and the exit code is 4. `--projected` does not turn this off. For this
 test the reuse distance counts as at least 500, so the limit is 500000 feet at the default and for
@@ -330,6 +334,10 @@ $ echo $?
 The same exit happens when every shared key has a blank or unreadable coordinate, when one
 layer has a header and no rows while the other has rows, and when both layers have a header and no
 rows. An export that came back empty is not a join that checked out.
+
+A row with a blank ID cannot be joined at all, so it is `UNVERIFIED` and a run that holds one
+exits 4 and lists its CSV line, however many other rows matched. The same exit 4 applies when a
+layer holds a single blank ID among thousands of good rows.
 
 When only some shared keys cannot be measured, the verdict is `INCOMPLETE` and the exit code is
 also 4. The run lists those pairs with their CSV lines. A layer pair of 100 hydrants where 99
@@ -569,11 +577,11 @@ left_key,right_key,tier,distance,left_line,right_line,left_district,right_distri
 
 | Code | Meaning |
 |---|---|
-| 0 | At least one pair was measured, every pair on a shared key could be measured, at least half of the rows on the smaller layer found a partner, and no match was disproved by the geometry. |
+| 0 | At least one pair was measured, every pair on a shared key could be measured, every row has an ID value, at least half of the rows on the smaller layer found a partner, and no match was disproved by the geometry. |
 | 1 | At least one match was disproved, by distance or by district. Do not publish the join. |
 | 2 | A file could not be read, or `--out` or `--crosswalk` could not be written. A UTF-16 file, a field longer than the `csv` module's 131072-character limit, or a row with more cells than the header lands here. |
 | 3 | Refused. The identifier is on more than one row, so nothing was compared. |
-| 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, fewer than half of the rows on the smaller layer found a partner, a refused district column left a drift pair unchecked (`NOTHING COMPARED` or `INCOMPLETE`), or every measured pair sat over the mismatch limit apart (`UNITS OR CRS MISMATCH`, 1000 times the reuse distance, at least 500000 feet). Two layers with no rows land here too. |
+| 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, some row had no ID value, fewer than half of the rows on the smaller layer found a partner, a refused district column left a drift pair unchecked (`NOTHING COMPARED` or `INCOMPLETE`), or every measured pair sat over the mismatch limit apart (`UNITS OR CRS MISMATCH`, 1000 times the reuse distance, at least 500000 feet). Two layers with no rows land here too. |
 | 64 | Usage error, including a column name that is not in the CSV, an unknown or abbreviated flag, an output path that is an input, and coordinates that look like degrees. |
 | 70 | An unexpected crash. This is a fault in the tool and not a finding. The traceback is on stderr. |
 
@@ -584,7 +592,7 @@ exit 0 for the same reason: "I checked and found nothing" and "I could not check
 `UNMATCHED`, `DRIFT` and `CANDIDATE` never fail the gate on their own. Half of any two-layer
 comparison is legitimately one-sided, and a tool that exited 1 on it would be ignored within a
 week. They do not make a run clean either: the run needs one measured pair, every pair on a shared key
-must be measurable, and at least half of the rows on the smaller layer must find a partner. A layer
+must be measurable, no row may lack an ID, and at least half of the rows on the smaller layer must find a partner. A layer
 that is a true subset of the other still joins all of its own rows, so it exits 0.
 
 ## Limits
@@ -607,7 +615,10 @@ that is a true subset of the other still joins all of its own rows, so it exits 
 - If most rows are `UNMATCHED`, the rematch pool is most of the layer, and run time grows with
   the square of its size. This happens when the two sides spell the ID differently. A run of
   10,000 random points a side took 95 seconds in one run on the Windows workstation (a later run
-  took 74 seconds) and printed no progress.
+  took 74 seconds) and printed no progress. With half of each layer unmatched, 6,000 rows a side
+  took 7.3 seconds and 20,000 rows a side took 81 seconds, against 0.2 seconds for the same
+  6,000-row layers without the rematch. A scheduled job that adds `--rematch-distance` to a large
+  layer can look hung.
   Fix the IDs first. The tool has no spatial index.
 - The district is read from a column. The tool does not intersect a point with a district
   polygon, so a district column that is stale is believed. Fill it with a spatial join first if
@@ -642,10 +653,14 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   header and exits 64, so the tool tests the header for NUL itself. Save the CSV as UTF-8. Whether
   a given export tool writes a UTF-8 BOM was not verified against vendor documentation; the
   reader accepts a BOM and does not need one.
-- A character the console cannot show prints as `?` instead of stopping the run. The file the
+- A character the console cannot show prints as `?` instead of stopping the run. The `replace`
+  error handler writes `?` for a character it cannot encode
+  ([Python codecs, error handlers](https://docs.python.org/3/library/codecs.html#error-handlers)). The file the
   tool writes is always UTF-8 without a BOM, so import it as UTF-8 in Excel, or Excel may show
   non-ASCII keys wrongly when you open it by double click. That Excel behaviour is not cited: the
-  Microsoft page on importing and exporting text files does not mention UTF-8 or a byte order mark.
+  Microsoft page on
+  [importing and exporting text files](https://support.microsoft.com/en-us/office/import-or-export-text-txt-or-csv-files-5250ac4c-663c-47ce-937b-339e391393ba)
+  does not mention UTF-8 or a byte order mark.
 - Duplicate header names are not detected; the last column of that name is used. A short row has
   its missing cells read as blank. A long row is refused (see the bullet on rows with more cells
   than the header).
@@ -658,8 +673,10 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   and come back. A run that pairs nothing exits 4 so that this cannot pass unseen.
 - CSV only. No geodatabase, no shapefile, no SDE connection. Reading a geodatabase would need
   `arcpy`, which would stop the tool running anywhere else.
-- It reads both files into memory. A few thousand rows a side runs in well under a second; a
-  statewide layer is not what this is for.
+- It reads both files into memory. A few thousand rows a side runs in well under a second
+  without `--rematch-distance` (3,000 rows a side took 0.2 seconds on the Windows workstation);
+  with it, see the rematch bullets above for the quadratic cost. A statewide layer is not what
+  this is for.
 - There is no `--fix`. The tool names the matches the geometry disproves and proposes
   candidates. Deciding which of the two objects keeps the number is an edit somebody signs for.
 - `DRIFT` is not a verdict. It is the band where the geometry has no opinion, and it exists so
@@ -731,11 +748,21 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   `--apply`, one more line saying the output was not written.
 - If the reader of standard output closes the pipe before the report is complete, the tool exits
   70 and writes no output file, so a job that pipes the report and uses `--apply` gets no files.
-- A pipeline that feeds `--out` or `--crosswalk` back in as an input layer gets `UNMATCHED` rows
-  for every guarded key. The strip-on-read helper exists only inside the self-test.
+- The tool's own `--out` and `--crosswalk` files do not read back as input layers. Their headers
+  (`side,csv_line,key,...` and `left_key,right_key,...`) are not the columns the reader wants, so a
+  run on them exits 64 until you rename columns, and then a guarded key still carries its
+  apostrophe and does not join to the plain key. The self-test pins the exit 64. The strip-on-read
+  helper exists only inside the self-test.
 - The output files are UTF-8 with no byte order mark. Whether Excel misreads a non-ASCII key in
   them was not tested.
 - Timings in this file are one-off measurements on one workstation and one server.
+- When the reader closes the output pipe the exit is 70 and the message says "This is a fault in
+  the tool", although the reader closed the pipe and the tool did not fail.
+- `idreuse.py` is checked out with Windows line endings on a Windows workstation, so run it as
+  `python3 idreuse.py` and not as `./idreuse.py`, where a carriage return ends the shebang line.
+- Very large thresholds hide a unit mismatch. The mismatch limit is 1000 times the reuse distance,
+  so `--confirm-distance 1e308 --reuse-distance 1e308` lets feet against metres exit 0 with
+  `CONFIRMED` pairs.
 - Coverage and `pyflakes` were run on Windows only. The Linux host has neither module installed.
 - The self-test starts one child Python process on the tool itself to check the console encoding.
   It still uses temporary files only, no network and no credentials.
@@ -749,9 +776,9 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   is larger than the pipe buffer. A short run piped to `head -1` still returns the real verdict code.
 - An output that is a hard link to an input, or reaches it by an 8.3 short name, is not detected
   as the input. An existing `--out` or `--crosswalk` file is overwritten under `--apply`.
-- Exit 0 allows up to half of the smaller layer to have no usable ID. A row with a blank ID is
-  `UNVERIFIED`, not `UNMATCHED`, and the half-joined floor counts pairs only, so read the
-  `UNVERIFIED` count as well as the `UNMATCHED` one.
+- A row with a blank ID is `UNVERIFIED`, not `UNMATCHED`, because the tool could not tell. One such
+  row on either side exits 4 with `INCOMPLETE` and the run lists the lines. A row with an ID and
+  no partner is `UNMATCHED` and does not.
 - An interrupt (Ctrl-C) is not caught, so the exit code is the interpreter's own and not 70.
 - A zero-byte input file exits 64 with `columns not in the CSV ... (no columns at all)`, not 4.
   The message names the cause. An export that has a header and no rows exits 4.

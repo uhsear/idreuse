@@ -35,10 +35,10 @@ CANDIDATE partner for a row the key could not pair, but only when each row is
 the other's single nearest. Nothing is written without --apply.
 
 Exit codes: 0 at least one pair was measured, every pair on a shared key could
-be measured, at least half of the smaller layer's rows found a partner, and no
+be measured, no row lacked an ID, at least half of the smaller layer's rows found a partner, and no
 match was disproved, 1 at least one match was disproved, 2 a file could not be
 read or written, 3 the anchor was refused, 4 the run could not tell (no pair
-was measurable, some shared-key pair was unmeasurable, fewer than half of
+was measurable, some shared-key pair was unmeasurable, a row had no ID, fewer than half of
 the smaller layer's rows joined, a refused district column left a drift pair
 unchecked, or every measured pair sat implausibly far apart; NOTHING COMPARED,
 INCOMPLETE or UNITS OR CRS MISMATCH), 64 usage
@@ -264,6 +264,13 @@ class Report(object):
         every one of its own rows, so it is not caught here."""
         smaller = min(len(self.left), len(self.right))
         return 2 * len(self.pairs) < smaller
+
+    @property
+    def unanchored(self):
+        """Rows with no ID value on either side. They are UNVERIFIED because
+        the tool could not tell whether they match, so a run holding one is
+        not clean, however many other rows joined."""
+        return [r for r in list(self.left) + list(self.right) if not r.key]
 
     @property
     def district_unchecked(self):
@@ -739,8 +746,8 @@ def gate(report):
         return 3
     if report.disproved:
         return 1
-    if (report.implausible or report.compared_nothing or report.unmeasured or report.mostly_unjoined
-            or report.district_unchecked):
+    if (report.implausible or report.compared_nothing or report.unmeasured or report.unanchored
+            or report.mostly_unjoined or report.district_unchecked):
         return 4
     return 0
 
@@ -823,6 +830,9 @@ def describe(report, sample=DEFAULT_SAMPLE):
              ["  %s  left line %d, right line %d"
               % (p.key, p.left.line, p.right.line) for p in report.unmeasured],
              sample)
+    _section(out, "rows with no ID value, which cannot be matched:",
+             ["  %s line %d" % (r.side, r.line) for r in report.unanchored],
+             sample)
     _section(out, "pairs whose two sides are in different districts:",
              ["  %s  %s" % (p.key, p.district_note)
               for p in report.pairs if p.district_note], sample)
@@ -859,6 +869,12 @@ def describe(report, sample=DEFAULT_SAMPLE):
                    "and this is not a clean join. Fix the blank or unreadable "
                    "coordinates and run again."
                    % (len(report.unmeasured), len(report.pairs)))
+    elif report.unanchored:
+        out.append("VERDICT: INCOMPLETE. %d row(s) have no ID value, so the "
+                   "tool could not tell whether they match. No measured "
+                   "match was disproved, and this is not a clean join. Fill "
+                   "the blank IDs or drop those rows and run again."
+                   % len(report.unanchored))
     elif report.mostly_unjoined:
         out.append("VERDICT: INCOMPLETE. Only %d of the %d rows on the smaller "
                    "layer found a partner on a shared key, so the geometry "
@@ -1691,6 +1707,25 @@ def _self_test(tmp):
                     [("K%d" % i, i * 1000.0, 0.0, None) for i in range(5)])
     check(len(subset.pairs) == 5 and gate(subset) == 0,
           "a layer that is a true subset of the other still exits 0")
+    blank = layers([("K%d" % i, 1000.0 * (i + 1), 100.0, None)
+                    for i in range(6)] + [("", 7000.0, 100.0, None)],
+                   [("K%d" % i, 1000.0 * (i + 1), 100.0, None)
+                    for i in range(6)] + [("", 8000.0, 100.0, None)])
+    check(blank.counts[UNVERIFIED] == 2 and len(blank.unanchored) == 2
+          and not blank.unmeasured and not blank.mostly_unjoined
+          and gate(blank) == 4,
+          "a row with no ID is UNVERIFIED, so the run exits 4 and not 0"
+          "  <-- pinned defect")
+    check(describe(blank)[-1].startswith("VERDICT: INCOMPLETE. 2 row(s) have "
+                                         "no ID value")
+          and "  left line 8" in describe(blank)
+          and "  right line 8" in describe(blank),
+          "and the verdict says so and names the two lines"
+          "  <-- pinned defect")
+    check(gate(layers([("K1", 1000.0, 100.0, None)],
+                      [("K1", 1000.0, 100.0, None), ("K2", 5000.0, 5.0, None)]
+                      )) == 0,
+          "a row with an ID and no partner is UNMATCHED and still exits 0")
     check(gate(layers([("H-0", 0.0, 0.0, None)], [("W-0", 0.0, 5.0, None)],
                       rematch_distance=50.0)) == 4,
           "but a CANDIDATE with no pair on a shared key compared nothing, "
@@ -1743,7 +1778,7 @@ def _self_test(tmp):
 
     # ---- argument handling
     a = _parse(["l.csv", "r.csv"])
-    check(a.apply is False, "--apply defaults to OFF")
+    check(a.apply is False, "--apply defaults to off")
     check(a.out is None, "--out defaults to nothing written")
     check(a.status_field is None, "--status-field defaults to off")
     check(a.right_id_field is None and a.right_x_field is None
@@ -1972,6 +2007,12 @@ def _self_test(tmp):
           and "no match was disproved by the geometry." not in out
           and "pairs: 1 on a shared key" in out,
           "the CLI exits 4 when one lucky key joins among 200 unjoined rows"
+          "  <-- pinned defect")
+    code, out, err = run_cli([tmpfile("blank_l.csv", spread("K", ",7000,100")),
+                              tmpfile("blank_r.csv", spread("K", ",8000,100"))])
+    check(code == 4 and "VERDICT: INCOMPLETE. 2 row(s) have no ID value" in out
+          and "no match was disproved by the geometry." not in out,
+          "the CLI exits 4 when a row on each side has a blank ID"
           "  <-- pinned defect")
     code, out, err = run_cli(base + ["--confirm-distance", "300",
                                      "--reuse-distance", "300"])
@@ -2278,8 +2319,8 @@ def _self_test(tmp):
     # H-1 is plain on the right; H-2 to H-100 carry a thousands separator.
     part_r = tmpfile("part-r.csv", "ASSET_ID,X,Y\nH-1,600001,700001\n" +
                      "".join('H-%d,"%s","%s"\n'
-                             % (i, "{:,}".format(600000 + i),
-                                "{:,}".format(700000 + i))
+                             % (i, "%d,%03d" % divmod(600000 + i, 1000),
+                                "%d,%03d" % divmod(700000 + i, 1000))
                              for i in range(2, 101)))
     code, out, err = run_cli([part_l, part_r])
     check(code == 4 and "VERDICT: INCOMPLETE. 99 of 100 pair(s)" in out
@@ -2961,6 +3002,10 @@ def _self_test(tmp):
     check([r[0] for r in walk_table[1:]] == expected
           and [r[1] for r in walk_table[1:]] == expected,
           "and the crosswalk's left_key and right_key carry the same text")
+    code, out, err = run_cli([formula_out, formula_out])
+    check(code == 64 and "columns not in the CSV: ASSET_ID, X, Y" in err,
+          "the tool's own --out file does not read back as an input layer: "
+          "its header does not fit, so the run exits 64, not UNMATCHED")
 
     # ---- the harness itself. A check() that cannot record a failure would
     # report every defect above as a pass, which is the one failure no other

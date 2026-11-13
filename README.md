@@ -615,7 +615,9 @@ that is a true subset of the other still joins all of its own rows, so it exits 
 - District values are compared as exact text after trimming. `7`, `07` and `D7` are three
   different districts. The vocabulary check catches a column that shares nothing across the
   sides, or that never agrees. It does not catch two sides that share some values and differ on
-  others, so make the codes match before the run.
+  others, so make the codes match before the run. On such data a `DRIFT` pair whose codes differ
+  is escalated to `REUSED` and the run exits 1, even though the difference is only the spelling
+  of the code and the geometry gave no verdict on that pair.
 - The refusal of a single-value status column is a message only. A column with one value can
   never make two sides disagree, so setting it aside changes no result. A refused district column
   is different: it stops the escalation, so a run with a drift pair exits 4 (see "The district
@@ -627,8 +629,8 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   local grid, is treated the same way. A zero in only one axis is a real coordinate. Any other
   placeholder is read as a real number. A coordinate of exactly -9999, -99999, -999999 or -9999999 on
   either axis is also read as a missing point, so a row with it on both sides is `UNVERIFIED` and
-  not a `CONFIRMED` pair at distance 0. The same values with a plus sign, and any other
-  placeholder, are read as real numbers and push their pair far apart.
+  not a `CONFIRMED` pair at distance 0. A coordinate of +9999 (the same number with a plus sign)
+  or any other placeholder is read as a real number and is measured like any coordinate.
 - A coordinate cell is read with Python `float()`, so underscores and Unicode digits are accepted
   as numbers. `1_000` reads as 1000. A quoted thousands separator such as `"1,000"` is not a number and
   reads as no coordinate. An unquoted one splits the cell in two, the row is longer than the header,
@@ -645,7 +647,8 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   non-ASCII keys wrongly when you open it by double click. That Excel behaviour is not cited: the
   Microsoft page on importing and exporting text files does not mention UTF-8 or a byte order mark.
 - Duplicate header names are not detected; the last column of that name is used. A short row has
-  its missing cells read as blank, and a long row has its extra cells ignored.
+  its missing cells read as blank. A long row is refused (see the bullet on rows with more cells
+  than the header).
 - The crosswalk is keyed on the pair of row keys and their CSV lines. A permanent asset number
   that is a third column, distinct from the join key, is not read, and the crosswalk keeps no
   history between runs.
@@ -685,7 +688,7 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   character in front of them, such as a zero-width space, is not looked through, and whether a
   spreadsheet runs such a cell as a formula was not tested.
 - The input reader trims leading whitespace from keys and districts, so a key such as ` =1` is
-  guarded as `=1`. The writer alone leaves a cell that begins with whitespace unchanged.
+  written as `'=1`, with the apostrophe. The writer alone leaves a cell that begins with whitespace unchanged.
 - A key such as `1e5` or `00123` can still be rewritten by the spreadsheet on open, so open `--out` and `--crosswalk` with the key column
   formatted as text.
 - A `REUSED` pair whose rows are proposed as candidates by `--rematch-distance` is counted and
@@ -705,8 +708,10 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   save-and-reopen problem better than an apostrophe. This tool does not use it.
 - Both layers must share one unit. The tool detects a feet layer paired with a metres layer only
   when two or more pairs are measured and every one of them is over the mismatch limit apart, which is 1000 times the reuse distance but never under 500000 feet. A
-  single pair, or a mismatch that puts some pairs close together, is not detected. If the numbers
-  happen to agree, the run prints a clean `VERDICT`.
+  mismatch that puts some pairs close together is not detected as one. With a single measured pair
+  the tool cannot tell a mismatch from a recycled key, so that pair is called `REUSED`, the
+  `VERDICT` says the match is disproved, and the exit code is 1. If the numbers happen to agree,
+  the run prints a clean `VERDICT`.
 - A non-UTF-8 key on one side never pairs with the UTF-8 spelling on the other side, so it is
   never measured. The exit code can still be 0 if enough other keys joined.
 - A row with more cells than the header is refused with exit 2 and a message that names the line,

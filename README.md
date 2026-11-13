@@ -48,6 +48,8 @@ PASS  the CLI exits 4 when one lucky key joins among 200 unjoined rows  <-- pinn
 ...
 PASS  coordinates with thousands separators are UNVERIFIED, so the run exits 4 and does not call itself clean  <-- pinned defect
 ...
+PASS  an unquoted thousands separator makes a row longer than the header, so the run refuses it with exit 2 and does not read a shifted Y as a CONFIRMED pair  <-- pinned defect
+...
 PASS  198 of 200 rows with unreadable coordinates exit 4 and say how many pairs went unmeasured, instead of a clean exit 0  <-- pinned defect
 ...
 PASS  '7' on one side and 'D7' on the other share no value, so the column is refused, nothing is escalated and the run exits 4, not a clean 0  <-- pinned defect
@@ -94,10 +96,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-610 assertions, 0 failed
+612 assertions, 0 failed
 ```
 
-The full run prints all 610 assertions. Each `...` line above is where this block is cut.
+The full run prints all 612 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -124,7 +126,7 @@ single-cell data.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Both layers are CSVs, which is what every asset layer can be exported as.
 
-The self-test prints the same 610 assertions on Windows with Python 3.13.2 and with Python 3.9.25,
+The self-test prints the same 612 assertions on Windows with Python 3.13.2 and with Python 3.9.25,
 and on one Linux host (Ubuntu) with Python 3.12.3 and with Python 3.9.25. All four outputs are
 identical line for line once the Windows carriage returns are stripped.
 `coverage run --branch idreuse.py --self-test` reports 100 percent of lines and branches.
@@ -569,7 +571,7 @@ left_key,right_key,tier,distance,left_line,right_line,left_district,right_distri
 |---|---|
 | 0 | At least one pair was measured, every pair on a shared key could be measured, at least half of the rows on the smaller layer found a partner, and no match was disproved by the geometry. |
 | 1 | At least one match was disproved, by distance or by district. Do not publish the join. |
-| 2 | A file could not be read, or `--out` or `--crosswalk` could not be written. A UTF-16 file, or a field longer than the `csv` module's 131072-character limit, lands here. |
+| 2 | A file could not be read, or `--out` or `--crosswalk` could not be written. A UTF-16 file, a field longer than the `csv` module's 131072-character limit, or a row with more cells than the header lands here. |
 | 3 | Refused. The identifier is on more than one row, so nothing was compared. |
 | 4 | The run could not tell. No pair on a shared key had a measurable separation, some pair had none, fewer than half of the rows on the smaller layer found a partner, a refused district column left a drift pair unchecked (`NOTHING COMPARED` or `INCOMPLETE`), or every measured pair sat over the mismatch limit apart (`UNITS OR CRS MISMATCH`, 1000 times the reuse distance, at least 500000 feet). Two layers with no rows land here too. |
 | 64 | Usage error, including a column name that is not in the CSV, an unknown or abbreviated flag, an output path that is an input, and coordinates that look like degrees. |
@@ -628,8 +630,9 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   not a `CONFIRMED` pair at distance 0. The same values with a plus sign, and any other
   placeholder, are read as real numbers and push their pair far apart.
 - A coordinate cell is read with Python `float()`, so underscores and Unicode digits are accepted
-  as numbers. `1_000` reads as 1000. A thousands separator such as `1,000` is not a number and
-  reads as no coordinate.
+  as numbers. `1_000` reads as 1000. A quoted thousands separator such as `"1,000"` is not a number and
+  reads as no coordinate. An unquoted one splits the cell in two, the row is longer than the header,
+  and the run is refused with exit 2 (next bullet).
 - Only UTF-8 CSV is supported; other encodings are decoded lossily without a warning. Bytes that
   are not UTF-8 become U+FFFD, and two different keys can collapse into one. A UTF-16 file is
   refused with exit 2 and a message that names a NUL character, on every supported Python
@@ -706,8 +709,15 @@ that is a true subset of the other still joins all of its own rows, so it exits 
   happen to agree, the run prints a clean `VERDICT`.
 - A non-UTF-8 key on one side never pairs with the UTF-8 spelling on the other side, so it is
   never measured. The exit code can still be 0 if enough other keys joined.
-- A row with more cells than the header keeps the cells by position, so an extra cell in the
-  middle of a row shifts the cells after it and the coordinates can be read from the wrong column.
+- A row with more cells than the header is refused with exit 2 and a message that names the line,
+  because the extra cells shift every cell after them and a coordinate would be read from the wrong
+  column. A row with fewer cells than the header is not refused: the missing cells read as
+  blank, so a missing coordinate leaves the pair `UNVERIFIED`.
+- A layer pair that is offset as a whole, for example by a datum shift, puts every pair in the drift
+  band and exits 0, so read the `DRIFT` count as well as the exit code.
+- A unit mismatch on small coordinates is not detected as a mismatch. It exits 1 with every pair
+  `REUSED`.
+- A status disagreement is listed beside the verdict and never changes the exit code.
 - A NUL byte below the header is refused on Python 3.9 with exit 2 and read as part of the key on
   3.12 and later. Save the CSV as clean UTF-8 so every version agrees.
 - A `ValueError` raised from inside the comparison exits 64 like a usage error, so read the

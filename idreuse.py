@@ -2238,6 +2238,23 @@ def _self_test(tmp):
           and "no match was disproved" not in out,
           "coordinates with thousands separators are UNVERIFIED, so the run "
           "exits 4 and does not call itself clean  <-- pinned defect")
+    rag_l = tmpfile("rag-l.csv", "ASSET_ID,X,Y\nA-1,620,100.0,1580200.0\n"
+                    "A-2,620,100.0,1580600.0\n")
+    rag_r = tmpfile("rag-r.csv", "ASSET_ID,X,Y\nA-1,620,100.0,1831000.0\n"
+                    "A-2,620,100.0,1580600.0\n")
+    code, out, err = run_cli([rag_l, rag_r])
+    check(code == 2 and "line 2 has 4 cells but the header has 3" in err
+          and "VERDICT" not in out,
+          "an unquoted thousands separator makes a row longer than the "
+          "header, so the run refuses it with exit 2 and does not read a "
+          "shifted Y as a CONFIRMED pair  <-- pinned defect")
+    short_l = tmpfile("short-l.csv",
+                      "ASSET_ID,X,Y\nA-1,620100.0,1580200.0\n")
+    short_r = tmpfile("short-r.csv", "ASSET_ID,X,Y\nA-1,620100.0\n")
+    code, out, err = run_cli([short_l, short_r])
+    check(code == 4 and "UNVERIFIED" in out,
+          "a row shorter than the header reads as no coordinate, so it is "
+          "UNVERIFIED and not a crash")
     spell_l = tmpfile("spell-l.csv", "ID,X,Y\nH-1,1000,1000\nH-2,2000,2000\n")
     spell_r = tmpfile("spell-r.csv", "ID,X,Y\nH1,1000,1000\nH2,2000,2000\n")
     code, out, err = run_cli([spell_l, spell_r, "--id-field", "ID"])
@@ -2456,7 +2473,7 @@ def _self_test(tmp):
                       '\n'
                       'B,3,4,x\n'
                       'C,5,6,"a\r\nb\r\nc"\r\n'
-                      'D,7,8,x,"e\nf"\n'
+                      'D,7,8,"e\nf"\n'
                       'E,9,10\n')
     nl_rows, nl_header = read_csv(nl_path)
     check([r.line for r in nl_rows] == [2, 5, 6, 9, 11],
@@ -3016,8 +3033,7 @@ class _Record(dict):
 
 def _breaks(value):
     """How many line breaks one parsed cell carries (a quoted newline)."""
-    cells = value if isinstance(value, list) else [value]
-    return sum(len(_BREAK.findall(c)) for c in cells if c)
+    return len(_BREAK.findall(value)) if value else 0
 
 
 def looks_like_degrees(rows):
@@ -3071,6 +3087,17 @@ def read_csv(path):
                             "UTF-16?). Save the CSV as UTF-8")
         rows = []
         for raw in reader:
+            if None in raw:
+                # DictReader files the cells past the header under None and
+                # the row looks whole. An unquoted 620,100.0 in X shifts Y
+                # into a different valid point and the run would exit 0.
+                raise csv.Error(
+                    "line %d has %d cells but the header has %d. An unquoted "
+                    "comma inside a value, such as a thousands separator in "
+                    "a coordinate, shifts the cells after it. Quote the "
+                    "value or remove the comma"
+                    % (reader.line_num, len(reader.fieldnames) + len(raw[None]),
+                       len(reader.fieldnames)))
             record = _Record(raw)
             record.line = reader.line_num - sum(_breaks(v)
                                                 for v in raw.values())
